@@ -26,6 +26,7 @@ public class NativeMediaBackend : IMediaBackend
     public NativeMediaBackend(string name, bool available = true) { Name = name; IsAvailable = available; }
     public string Name { get; }
     public virtual bool IsAvailable { get; protected init; }
+    public virtual bool RequiresUiThreadOpen => false;
     public MediaState State { get { lock (_gate) { UpdateClock(); return _state; } } }
     public virtual TimeSpan Position { get { lock (_gate) { UpdateClock(); return _position; } } }
     public virtual TimeSpan Duration { get { lock (_gate) return _duration; } protected set { lock (_gate) { _duration = value; if (!_isStreaming) _bufferedPosition = value; } } }

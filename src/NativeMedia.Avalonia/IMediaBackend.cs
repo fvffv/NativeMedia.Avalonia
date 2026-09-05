@@ -5,6 +5,11 @@ public interface IMediaBackend : IAsyncDisposable, IDisposable
 {
     string Name { get; }
     bool IsAvailable { get; }
+    /// <summary>
+    /// Indicates that opening must stay on the Avalonia/native UI thread.
+    /// <para>Indicates whether opening must remain on the Avalonia/native UI thread.</para>
+    /// </summary>
+    bool RequiresUiThreadOpen { get; }
     MediaState State { get; }
     TimeSpan Position { get; }
     TimeSpan Duration { get; }

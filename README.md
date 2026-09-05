@@ -17,11 +17,12 @@ Native media backends. One unified Avalonia playback experience.
 - 视频画面和控制栏位于同一个 Avalonia 渲染树，任意原生 Avalonia 控件都可以覆盖在视频上方 / The video and controls share the Avalonia render tree, so any native Avalonia control can overlay the video
 - 兼容 NativeAOT；公共 API、属性、方法和事件带有中英双语 XML 注释 / NativeAOT-friendly, with bilingual XML documentation on the public API
 - Linux 缺少 FFmpeg 时可以通过系统包管理器请求安装 / Can request installation of FFmpeg through the Linux package manager when it is missing
+- 媒体打开和环境探测不会阻塞 Avalonia UI；Windows MFPlay 保留专用消息线程 / Media opening and environment probing do not block the Avalonia UI; Windows MFPlay keeps a dedicated message thread
 
 ## 安装 / Installation
 
 ```bash
-dotnet add package NativeMedia.Avalonia --version 1.0.1
+dotnet add package NativeMedia.Avalonia --version 1.0.8
 ```
 
 包名是 `NativeMedia.Avalonia`，程序集和命名空间仍然是 `NativeMedia.Avalonia`。  
@@ -32,22 +33,15 @@ The package targets .NET `10.0` and references Avalonia `12.1.1`.
 
 ## 快速开始 / Quick start
 
-在应用启动时注册当前平台适配器。Windows 和 macOS 也会通过模块初始化器自动注册，显式调用可以让启动代码更直观；Linux 建议显式启用 FFmpeg。
+NuGet 包会通过 `buildTransitive` 模块初始化器按当前操作系统自动注册后端，应用不需要再编写平台判断代码。只引用 `NativeMedia.Avalonia` 并创建播放器即可。需要替换为自定义后端时，仍可在创建播放器之前调用 `MediaBackendFactory.Register(...)`。
 
-Register the adapter for the current platform at application startup. Windows and macOS also register through module initializers; explicit registration keeps startup code clear. On Linux, explicitly enable FFmpeg.
+The NuGet package automatically registers the backend for the current operating system through a `buildTransitive` module initializer. No platform-specific startup code is required. Just reference `NativeMedia.Avalonia` and create a player. Applications can still call `MediaBackendFactory.Register(...)` before creating a player to override the backend.
 
 ```csharp
 using NativeMedia.Avalonia;
-using NativeMedia.Avalonia.Linux;
-using NativeMedia.Avalonia.macOS;
-using NativeMedia.Avalonia.Windows;
 
-if (OperatingSystem.IsWindows())
-    WindowsMediaFoundation.Use();
-else if (OperatingSystem.IsLinux())
-    LinuxFfmpeg.Use();
-else if (OperatingSystem.IsMacOS())
-    MacAvFoundation.Use();
+// 自动选择当前平台后端 / The current platform backend is selected automatically.
+var player = new VideoPlayer();
 ```
 
 在 Avalonia XAML 中使用控件：  
@@ -220,14 +214,14 @@ dotnet pack src/NativeMedia.Avalonia/NativeMedia.Avalonia.csproj -c Release --no
 NuGet 包输出到：
 
 ```text
-artifacts/packages/NativeMedia.Avalonia.1.0.1.nupkg
+artifacts/packages/NativeMedia.Avalonia.1.0.8.nupkg
 ```
 
 要在本地测试包：
 
 ```powershell
 dotnet new avalonia.app -n NativeMediaPackageSample
-dotnet add NativeMediaPackageSample package NativeMedia.Avalonia --version 1.0.1 --source .\artifacts\packages
+dotnet add NativeMediaPackageSample package NativeMedia.Avalonia --version 1.0.8 --source .\artifacts\packages
 ```
 
 ## 目录结构 / Repository layout

@@ -88,12 +88,13 @@
     <Setter Property="MinWidth" Value="240"/><Setter Property="MinHeight" Value="160"/>
     <Setter Property="Template">
       <ControlTemplate>
-        <Border CornerRadius="10" ClipToBounds="True" Background="#090B0F">
+        <!-- The host controls clipping/corner radius; the player itself stays rectangular. -->
+        <Border CornerRadius="0" ClipToBounds="False" Background="#090B0F">
           <Grid Background="#05070A">
             <media:VideoFrameSurface Source="{TemplateBinding VideoFrame}" IsVisible="{TemplateBinding UsesCompositedVideo}" Stretch="Uniform" />
             <media:NativeMediaSurface x:Name="PART_VideoSurface" IsVisible="{TemplateBinding UsesNativeVideoSurface}" />
-            <Button Theme="{StaticResource CenterMediaControlButtonTheme}" Classes="center-media-control" x:Name="PART_CenterPlayPauseButton" IsVisible="{TemplateBinding CenterPlayVisible}" HorizontalAlignment="Center" VerticalAlignment="Center" Width="68" Height="48" Content="▶" FontSize="22" Padding="0" HorizontalContentAlignment="Center" VerticalContentAlignment="Center" Cursor="Hand" CornerRadius="6" />
-            <Border HorizontalAlignment="Center" VerticalAlignment="Top" Margin="12" MaxWidth="560" IsVisible="{TemplateBinding RuntimeStatusVisible}" Background="#DD101820" CornerRadius="5" Padding="12,8">
+            <Button Theme="{StaticResource CenterMediaControlButtonTheme}" Classes="center-media-control" x:Name="PART_CenterPlayPauseButton" IsVisible="{TemplateBinding CenterPlayVisible}" HorizontalAlignment="Center" VerticalAlignment="Center" Width="68" Height="48" Content="▶" FontSize="22" Padding="0" HorizontalContentAlignment="Center" VerticalContentAlignment="Center" Cursor="Hand" CornerRadius="0" />
+            <Border HorizontalAlignment="Center" VerticalAlignment="Top" Margin="12" MaxWidth="560" IsVisible="{TemplateBinding RuntimeStatusVisible}" Background="#DD101820" CornerRadius="0" Padding="12,8">
               <TextBlock Text="{TemplateBinding RuntimeStatus}" Foreground="White" TextWrapping="Wrap" TextAlignment="Center" />
             </Border>
             <Border VerticalAlignment="Bottom" x:Name="PART_ControlOverlay" IsVisible="{TemplateBinding ControlsVisible}" Background="#D9000000" Padding="12,8">
@@ -128,7 +129,7 @@
     <Setter Property="Template">
       <ControlTemplate>
         <Grid>
-          <Border x:Name="PART_ControlOverlay" CornerRadius="8" Background="#D9000000" Padding="12" IsVisible="{TemplateBinding ControlsVisible}">
+          <Border x:Name="PART_ControlOverlay" CornerRadius="0" Background="#D9000000" Padding="12" IsVisible="{TemplateBinding ControlsVisible}">
           <Grid RowDefinitions="Auto,Auto" RowSpacing="5">
             <Grid Grid.Row="0" Height="22"><ProgressBar Maximum="{TemplateBinding ProgressMaximum}" Value="{TemplateBinding BufferedPositionSeconds}" Height="4" VerticalAlignment="Center" Foreground="#66777777" Background="#66777777" IsHitTestVisible="False" /><ProgressBar Maximum="{TemplateBinding ProgressMaximum}" Value="{TemplateBinding PositionSeconds}" Height="4" VerticalAlignment="Center" Foreground="#149BFF" Background="Transparent" IsHitTestVisible="False" /><Slider x:Name="PART_SeekSlider" Minimum="0" Maximum="{TemplateBinding ProgressMaximum}" Value="{TemplateBinding PositionSeconds}" Height="22" Cursor="Hand" VerticalAlignment="Center" Opacity="0" /></Grid>
             <Grid Grid.Row="1" ColumnDefinitions="Auto,Auto,Auto,*,Auto,Auto" ColumnSpacing="8">
@@ -140,7 +141,7 @@
             </Grid>
           </Grid>
           </Border>
-          <Border HorizontalAlignment="Center" VerticalAlignment="Top" Margin="12" MaxWidth="520" IsVisible="{TemplateBinding RuntimeStatusVisible}" Background="#DD101820" CornerRadius="5" Padding="10,6"><TextBlock Text="{TemplateBinding RuntimeStatus}" Foreground="White" TextWrapping="Wrap" TextAlignment="Center" /></Border>
+          <Border HorizontalAlignment="Center" VerticalAlignment="Top" Margin="12" MaxWidth="520" IsVisible="{TemplateBinding RuntimeStatusVisible}" Background="#DD101820" CornerRadius="0" Padding="10,6"><TextBlock Text="{TemplateBinding RuntimeStatus}" Foreground="White" TextWrapping="Wrap" TextAlignment="Center" /></Border>
         </Grid>
       </ControlTemplate>
     </Setter>

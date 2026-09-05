@@ -188,17 +188,54 @@ public abstract class MediaPlayer : TemplatedControl, IAsyncDisposable, IDisposa
         if (_disposed || string.IsNullOrWhiteSpace(source)) return;
         var oldStreaming = IsStreaming;
         var oldKind = SourceKind;
-        SetState(MediaState.Loading);
-        await _backend.OpenAsync(source, cancellationToken);
-        if (generation != _openGeneration || _disposed) return;
-        RaisePropertyChanged(IsStreamingProperty, oldStreaming, IsStreaming);
-        RaisePropertyChanged(SourceKindProperty, oldKind, SourceKind);
-        if (State == MediaState.Ready && AutoPlay) await PlayAsync();
+        try
+        {
+            SetState(MediaState.Loading);
+
+            // Most backends can perform synchronous startup away from the UI
+            // thread (AVPlayer, ffprobe, FFmpeg process setup). Windows MFPlay
+            // is the exception: its hidden HWND/message pump must stay on the
+            // native UI thread, so Source changes are deferred until the host
+            // window has had a chance to render before that short setup runs.
+            if (_backend.RequiresUiThreadOpen)
+                await _backend.OpenAsync(source, cancellationToken);
+            else
+                await Task.Run(() => _backend.OpenAsync(source, cancellationToken), cancellationToken);
+
+            if (generation != _openGeneration || _disposed) return;
+            RaisePropertyChanged(IsStreamingProperty, oldStreaming, IsStreaming);
+            RaisePropertyChanged(SourceKindProperty, oldKind, SourceKind);
+            if (State == MediaState.Ready && AutoPlay) await PlayAsync();
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // A newer Source value or an explicit cancellation superseded this
+            // open request. The newer request owns the player state.
+        }
+        catch (Exception ex)
+        {
+            if (generation != _openGeneration || _disposed) return;
+            OnUi(() =>
+            {
+                SetState(MediaState.Error);
+                var oldStatus = _runtimeStatus;
+                _runtimeStatus = ex.Message;
+                RaisePropertyChanged(RuntimeStatusProperty, oldStatus, _runtimeStatus);
+                RaisePropertyChanged(RuntimeStatusVisibleProperty, !string.IsNullOrWhiteSpace(oldStatus), RuntimeStatusVisible);
+                Error?.Invoke(this, new MediaErrorEventArgs(ex.Message, ex));
+            });
+        }
     }
     private void StartOpenSource(string? source)
     {
         var generation = Interlocked.Increment(ref _openGeneration);
-        _ = OpenSourceAsync(source, CancellationToken.None, generation);
+        Dispatcher.UIThread.Post(
+            () =>
+            {
+                if (generation == _openGeneration && !_disposed)
+                    _ = OpenSourceAsync(source, CancellationToken.None, generation);
+            },
+            DispatcherPriority.Background);
     }
     /// <summary>打开本地路径、file URI、HTTP URL 或 HTTPS URL。<para>Opens a local path, file URI, HTTP URL, or HTTPS URL.</para></summary>
     /// <param name="source">媒体路径或 URL。<para>Media path or URL.</para></param>

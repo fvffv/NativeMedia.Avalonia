@@ -10,7 +10,7 @@
 
     <!-- NuGet package metadata / NuGet 包元数据 -->
     <PackageId>NativeMedia.Avalonia</PackageId>
-    <Version>1.0.1</Version>
+    <Version>1.0.8</Version>
     <Authors>fvffv</Authors>
     <Title>NativeMedia.Avalonia</Title>
     <Description>A lightweight cross-platform native audio and video playback library for Avalonia 12. It uses the appropriate native media backend for each platform, including Windows Media Foundation, macOS AVFoundation, and Linux FFmpeg, while providing a unified, simple, MVVM-friendly, and NativeAOT-compatible playback API.</Description>
@@ -24,6 +24,7 @@
 
   <ItemGroup>
     <PackageReference Include="Avalonia" Version="12.1.1" />
+    <Compile Remove="buildTransitive\**" />
   </ItemGroup>
 
   <!-- Files displayed by NuGet.org and IntelliSense / NuGet.org 与 IntelliSense 使用的文件 -->
@@ -87,6 +88,8 @@
     <None Include="$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.Linux\**\*.cs" Exclude="$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.Linux\bin\**\*;$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.Linux\obj\**\*" Pack="true" PackagePath="src\NativeMedia.Avalonia.Linux" />
     <None Include="$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.macOS\**\*.cs" Exclude="$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.macOS\bin\**\*;$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.macOS\obj\**\*" Pack="true" PackagePath="src\NativeMedia.Avalonia.macOS" />
     <Content Include="$(MSBuildProjectDirectory)\Themes\**\*.axaml" Pack="true" PackagePath="src\NativeMedia.Avalonia\Themes" />
+    <None Include="$(MSBuildProjectDirectory)\buildTransitive\NativeMedia.Avalonia.props" Pack="true" PackagePath="buildTransitive\NativeMedia.Avalonia.props" />
+    <None Include="$(MSBuildProjectDirectory)\buildTransitive\NativeMedia.Avalonia.AutoRegistration.g.cs" Pack="true" PackagePath="buildTransitive\NativeMedia.Avalonia.AutoRegistration.g.cs" />
   </ItemGroup>
 
 </Project>

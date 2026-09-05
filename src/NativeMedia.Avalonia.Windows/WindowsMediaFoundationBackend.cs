@@ -27,6 +27,7 @@ public sealed class WindowsMediaFoundationBackend : NativeMediaBackend
     private static readonly Guid PositionType100Ns = Guid.Empty;
 
     public WindowsMediaFoundationBackend() : base("Windows Media Foundation", OperatingSystem.IsWindows()) { }
+    public override bool RequiresUiThreadOpen => true;
 
     public override async Task OpenAsync(string source, CancellationToken cancellationToken = default)
     {
