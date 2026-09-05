@@ -1,0 +1,148 @@
+<ResourceDictionary xmlns="https://github.com/avaloniaui"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:media="using:NativeMedia.Avalonia">
+  <Design.PreviewWith>
+    <Border Padding="20" Background="#101216"><media:VideoPlayer Width="720" Height="420" /></Border>
+  </Design.PreviewWith>
+
+  <!--
+    The Fluent Button theme paints its own pointer-over/pressed layers.  That
+    layer is intentionally not used by the media controls: on some Fluent
+    theme variants it replaces the foreground with a dark brush, making the
+    glyph look black or disappear against the video.  This small, self
+    contained theme binds the state brushes directly to the button template so
+    the media controls always keep a readable white glyph.
+  -->
+  <ControlTheme x:Key="MediaControlButtonTheme" TargetType="Button">
+    <Setter Property="Foreground" Value="#FFFFFFFF" />
+    <Setter Property="Background" Value="#00000000" />
+    <Setter Property="BorderBrush" Value="#00000000" />
+    <Setter Property="BorderThickness" Value="0" />
+    <Setter Property="Padding" Value="6,3" />
+    <Setter Property="HorizontalContentAlignment" Value="Center" />
+    <Setter Property="VerticalContentAlignment" Value="Center" />
+    <Setter Property="Focusable" Value="False" />
+    <Setter Property="Template">
+      <ControlTemplate>
+        <Border x:Name="PART_MediaButtonBorder"
+                Background="{TemplateBinding Background}"
+                BorderBrush="{TemplateBinding BorderBrush}"
+                BorderThickness="{TemplateBinding BorderThickness}"
+                CornerRadius="{TemplateBinding CornerRadius}"
+                Padding="{TemplateBinding Padding}">
+          <ContentPresenter Content="{TemplateBinding Content}"
+                            ContentTemplate="{TemplateBinding ContentTemplate}"
+                            HorizontalContentAlignment="{TemplateBinding HorizontalContentAlignment}"
+                            VerticalContentAlignment="{TemplateBinding VerticalContentAlignment}"
+                            Foreground="{TemplateBinding Foreground}" />
+        </Border>
+      </ControlTemplate>
+    </Setter>
+    <Style Selector="^:pointerover">
+      <Setter Property="Foreground" Value="#FFFFFFFF" />
+      <Setter Property="Background" Value="#3DFFFFFF" />
+      <Setter Property="BorderBrush" Value="#80FFFFFF" />
+      <Setter Property="BorderThickness" Value="1" />
+    </Style>
+    <Style Selector="^:pressed">
+      <Setter Property="Foreground" Value="#FFFFFFFF" />
+      <Setter Property="Background" Value="#70FFFFFF" />
+      <Setter Property="BorderBrush" Value="#BFFFFFFF" />
+      <Setter Property="BorderThickness" Value="1" />
+    </Style>
+    <Style Selector="^:focus-visible">
+      <Setter Property="Foreground" Value="#FFFFFFFF" />
+      <Setter Property="BorderBrush" Value="#FFFFFFFF" />
+      <Setter Property="BorderThickness" Value="1" />
+    </Style>
+    <Style Selector="^:disabled">
+      <Setter Property="Foreground" Value="#99FFFFFF" />
+      <Setter Property="Opacity" Value="0.6" />
+    </Style>
+  </ControlTheme>
+
+  <ControlTheme x:Key="CenterMediaControlButtonTheme" TargetType="Button" BasedOn="{StaticResource MediaControlButtonTheme}">
+    <Setter Property="Background" Value="#99000000" />
+    <Setter Property="BorderBrush" Value="#66FFFFFF" />
+    <Setter Property="BorderThickness" Value="1" />
+    <Style Selector="^:pointerover">
+      <Setter Property="Foreground" Value="#FFFFFFFF" />
+      <Setter Property="Background" Value="#CC1A1A1A" />
+      <Setter Property="BorderBrush" Value="#CCFFFFFF" />
+      <Setter Property="BorderThickness" Value="1" />
+    </Style>
+    <Style Selector="^:pressed">
+      <Setter Property="Foreground" Value="#FFFFFFFF" />
+      <Setter Property="Background" Value="#E62C2C2C" />
+      <Setter Property="BorderBrush" Value="#FFFFFFFF" />
+      <Setter Property="BorderThickness" Value="1" />
+    </Style>
+    <Style Selector="^:focus-visible">
+      <Setter Property="Foreground" Value="#FFFFFFFF" />
+      <Setter Property="BorderBrush" Value="#FFFFFFFF" />
+      <Setter Property="BorderThickness" Value="2" />
+    </Style>
+  </ControlTheme>
+
+  <ControlTheme x:Key="{x:Type media:VideoPlayer}" TargetType="media:VideoPlayer">
+    <Setter Property="MinWidth" Value="240"/><Setter Property="MinHeight" Value="160"/>
+    <Setter Property="Template">
+      <ControlTemplate>
+        <Border CornerRadius="10" ClipToBounds="True" Background="#090B0F">
+          <Grid Background="#05070A">
+            <media:VideoFrameSurface Source="{TemplateBinding VideoFrame}" IsVisible="{TemplateBinding UsesCompositedVideo}" Stretch="Uniform" />
+            <media:NativeMediaSurface x:Name="PART_VideoSurface" IsVisible="{TemplateBinding UsesNativeVideoSurface}" />
+            <Button Theme="{StaticResource CenterMediaControlButtonTheme}" Classes="center-media-control" x:Name="PART_CenterPlayPauseButton" IsVisible="{TemplateBinding CenterPlayVisible}" HorizontalAlignment="Center" VerticalAlignment="Center" Width="68" Height="48" Content="▶" FontSize="22" Padding="0" HorizontalContentAlignment="Center" VerticalContentAlignment="Center" Cursor="Hand" CornerRadius="6" />
+            <Border HorizontalAlignment="Center" VerticalAlignment="Top" Margin="12" MaxWidth="560" IsVisible="{TemplateBinding RuntimeStatusVisible}" Background="#DD101820" CornerRadius="5" Padding="12,8">
+              <TextBlock Text="{TemplateBinding RuntimeStatus}" Foreground="White" TextWrapping="Wrap" TextAlignment="Center" />
+            </Border>
+            <Border VerticalAlignment="Bottom" x:Name="PART_ControlOverlay" IsVisible="{TemplateBinding ControlsVisible}" Background="#D9000000" Padding="12,8">
+              <Grid RowDefinitions="Auto,Auto" RowSpacing="5">
+                <Grid Grid.Row="0" Height="22">
+                  <ProgressBar Maximum="{TemplateBinding ProgressMaximum}" Value="{TemplateBinding BufferedPositionSeconds}" Height="4" VerticalAlignment="Center" Foreground="#66777777" Background="#66777777" IsHitTestVisible="False" />
+                  <ProgressBar Maximum="{TemplateBinding ProgressMaximum}" Value="{TemplateBinding PositionSeconds}" Height="4" VerticalAlignment="Center" Foreground="#149BFF" Background="Transparent" IsHitTestVisible="False" />
+                  <Slider x:Name="PART_SeekSlider" Minimum="0" Maximum="{TemplateBinding ProgressMaximum}" Value="{TemplateBinding PositionSeconds}" Height="22" VerticalAlignment="Center" Cursor="Hand" Opacity="0" />
+                </Grid>
+                <Grid Grid.Row="1" ColumnDefinitions="Auto,Auto,Auto,*,Auto,Auto,Auto" ColumnSpacing="8">
+                  <Button Theme="{StaticResource MediaControlButtonTheme}" Classes="media-control" x:Name="PART_PlayPauseButton" MinWidth="34" Content="▶" FontSize="16" Cursor="Hand" />
+                  <Button Theme="{StaticResource MediaControlButtonTheme}" Classes="media-control" x:Name="PART_StopButton" Grid.Column="1" MinWidth="34" Content="■" FontSize="13" Cursor="Hand" />
+                  <Button Theme="{StaticResource MediaControlButtonTheme}" Classes="media-control" x:Name="PART_MuteButton" Grid.Column="2" MinWidth="34" Content="🔊" FontSize="15" Cursor="Hand" />
+                  <StackPanel Grid.Column="3" Orientation="Horizontal" Spacing="5" VerticalAlignment="Center">
+                    <TextBlock Text="{TemplateBinding CurrentTimeText}" Foreground="White" VerticalAlignment="Center" />
+                    <TextBlock Text="/" Foreground="#B8FFFFFF" VerticalAlignment="Center" />
+                    <TextBlock Text="{TemplateBinding DurationText}" Foreground="White" VerticalAlignment="Center" />
+                  </StackPanel>
+                  <Slider x:Name="PART_VolumeSlider" Grid.Column="4" Width="78" Minimum="0" Maximum="1" Cursor="Hand" VerticalAlignment="Center" />
+                  <Button Theme="{StaticResource MediaControlButtonTheme}" Classes="media-control" x:Name="PART_FullScreenButton" Grid.Column="6" MinWidth="34" Content="⛶" FontSize="18" Cursor="Hand" />
+                </Grid>
+              </Grid>
+            </Border>
+          </Grid>
+        </Border>
+      </ControlTemplate>
+    </Setter>
+  </ControlTheme>
+
+  <ControlTheme x:Key="{x:Type media:AudioPlayer}" TargetType="media:AudioPlayer">
+    <Setter Property="MinWidth" Value="240"/><Setter Property="MinHeight" Value="64"/>
+    <Setter Property="Template">
+      <ControlTemplate>
+        <Grid>
+          <Border x:Name="PART_ControlOverlay" CornerRadius="8" Background="#D9000000" Padding="12" IsVisible="{TemplateBinding ControlsVisible}">
+          <Grid RowDefinitions="Auto,Auto" RowSpacing="5">
+            <Grid Grid.Row="0" Height="22"><ProgressBar Maximum="{TemplateBinding ProgressMaximum}" Value="{TemplateBinding BufferedPositionSeconds}" Height="4" VerticalAlignment="Center" Foreground="#66777777" Background="#66777777" IsHitTestVisible="False" /><ProgressBar Maximum="{TemplateBinding ProgressMaximum}" Value="{TemplateBinding PositionSeconds}" Height="4" VerticalAlignment="Center" Foreground="#149BFF" Background="Transparent" IsHitTestVisible="False" /><Slider x:Name="PART_SeekSlider" Minimum="0" Maximum="{TemplateBinding ProgressMaximum}" Value="{TemplateBinding PositionSeconds}" Height="22" Cursor="Hand" VerticalAlignment="Center" Opacity="0" /></Grid>
+            <Grid Grid.Row="1" ColumnDefinitions="Auto,Auto,Auto,*,Auto,Auto" ColumnSpacing="8">
+              <Button Theme="{StaticResource MediaControlButtonTheme}" Classes="media-control" x:Name="PART_PlayPauseButton" MinWidth="34" Content="▶" FontSize="16" Cursor="Hand" />
+              <Button Theme="{StaticResource MediaControlButtonTheme}" Classes="media-control" x:Name="PART_StopButton" Grid.Column="1" MinWidth="34" Content="■" FontSize="13" Cursor="Hand" />
+              <Button Theme="{StaticResource MediaControlButtonTheme}" Classes="media-control" x:Name="PART_MuteButton" Grid.Column="2" MinWidth="34" Content="🔊" FontSize="15" Cursor="Hand" />
+              <StackPanel Grid.Column="3" Orientation="Horizontal" Spacing="5" VerticalAlignment="Center"><TextBlock Text="{TemplateBinding CurrentTimeText}" Foreground="White" /><TextBlock Text="/" Foreground="#B8FFFFFF" /><TextBlock Text="{TemplateBinding DurationText}" Foreground="White" /></StackPanel>
+              <Slider x:Name="PART_VolumeSlider" Grid.Column="4" Width="78" Minimum="0" Maximum="1" Cursor="Hand" VerticalAlignment="Center" />
+            </Grid>
+          </Grid>
+          </Border>
+          <Border HorizontalAlignment="Center" VerticalAlignment="Top" Margin="12" MaxWidth="520" IsVisible="{TemplateBinding RuntimeStatusVisible}" Background="#DD101820" CornerRadius="5" Padding="10,6"><TextBlock Text="{TemplateBinding RuntimeStatus}" Foreground="White" TextWrapping="Wrap" TextAlignment="Center" /></Border>
+        </Grid>
+      </ControlTemplate>
+    </Setter>
+  </ControlTheme>
+</ResourceDictionary>

@@ -1,0 +1,92 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>preview</LangVersion>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);1591</NoWarn>
+
+    <!-- NuGet package metadata / NuGet 包元数据 -->
+    <PackageId>NativeMedia.Avalonia</PackageId>
+    <Version>1.0.1</Version>
+    <Authors>fvffv</Authors>
+    <Title>NativeMedia.Avalonia</Title>
+    <Description>A lightweight cross-platform native audio and video playback library for Avalonia 12. It uses the appropriate native media backend for each platform, including Windows Media Foundation, macOS AVFoundation, and Linux FFmpeg, while providing a unified, simple, MVVM-friendly, and NativeAOT-compatible playback API.</Description>
+    <PackageTags>avalonia;media;audio;video;native;playback;mvvm;nativeaot;ffmpeg;media-foundation;avfoundation</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageLicenseFile>LICENSE</PackageLicenseFile>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+    <RepositoryType>git</RepositoryType>
+    <PackageOutputPath>$(MSBuildProjectDirectory)\..\..\artifacts\packages\</PackageOutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia" Version="12.1.1" />
+  </ItemGroup>
+
+  <!-- Files displayed by NuGet.org and IntelliSense / NuGet.org 与 IntelliSense 使用的文件 -->
+  <ItemGroup>
+    <None Include="$(MSBuildProjectDirectory)\..\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="$(MSBuildProjectDirectory)\..\..\LICENSE" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <!-- Include platform assemblies in the single package / 将平台适配程序集并入同一个包 -->
+  <PropertyGroup>
+    <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);IncludeNativeMediaPlatformAssemblies</TargetsForTfmSpecificBuildOutput>
+  </PropertyGroup>
+
+  <Target Name="BuildNativeMediaPlatformAssemblies" BeforeTargets="IncludeNativeMediaPlatformAssemblies">
+    <MSBuild
+      Projects="$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.Windows\NativeMedia.Avalonia.Windows.csproj;$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.Linux\NativeMedia.Avalonia.Linux.csproj;$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.macOS\NativeMedia.Avalonia.macOS.csproj"
+      Targets="Build"
+      Properties="Configuration=$(Configuration);TargetFramework=$(TargetFramework)"
+      BuildInParallel="true" />
+  </Target>
+
+  <Target Name="IncludeNativeMediaPlatformAssemblies" DependsOnTargets="BuildNativeMediaPlatformAssemblies">
+    <ItemGroup>
+      <BuildOutputInPackage Include="$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.Windows\bin\$(Configuration)\$(TargetFramework)\NativeMedia.Avalonia.Windows.dll">
+        <FinalOutputPath>$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.Windows\bin\$(Configuration)\$(TargetFramework)\NativeMedia.Avalonia.Windows.dll</FinalOutputPath>
+        <TargetPath>NativeMedia.Avalonia.Windows.dll</TargetPath>
+        <TargetFramework>$(TargetFramework)</TargetFramework>
+      </BuildOutputInPackage>
+      <BuildOutputInPackage Include="$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.Windows\bin\$(Configuration)\$(TargetFramework)\NativeMedia.Avalonia.Windows.xml" Condition="Exists('$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.Windows\bin\$(Configuration)\$(TargetFramework)\NativeMedia.Avalonia.Windows.xml')">
+        <FinalOutputPath>$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.Windows\bin\$(Configuration)\$(TargetFramework)\NativeMedia.Avalonia.Windows.xml</FinalOutputPath>
+        <TargetPath>NativeMedia.Avalonia.Windows.xml</TargetPath>
+        <TargetFramework>$(TargetFramework)</TargetFramework>
+      </BuildOutputInPackage>
+      <BuildOutputInPackage Include="$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.Linux\bin\$(Configuration)\$(TargetFramework)\NativeMedia.Avalonia.Linux.dll">
+        <FinalOutputPath>$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.Linux\bin\$(Configuration)\$(TargetFramework)\NativeMedia.Avalonia.Linux.dll</FinalOutputPath>
+        <TargetPath>NativeMedia.Avalonia.Linux.dll</TargetPath>
+        <TargetFramework>$(TargetFramework)</TargetFramework>
+      </BuildOutputInPackage>
+      <BuildOutputInPackage Include="$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.Linux\bin\$(Configuration)\$(TargetFramework)\NativeMedia.Avalonia.Linux.xml" Condition="Exists('$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.Linux\bin\$(Configuration)\$(TargetFramework)\NativeMedia.Avalonia.Linux.xml')">
+        <FinalOutputPath>$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.Linux\bin\$(Configuration)\$(TargetFramework)\NativeMedia.Avalonia.Linux.xml</FinalOutputPath>
+        <TargetPath>NativeMedia.Avalonia.Linux.xml</TargetPath>
+        <TargetFramework>$(TargetFramework)</TargetFramework>
+      </BuildOutputInPackage>
+      <BuildOutputInPackage Include="$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.macOS\bin\$(Configuration)\$(TargetFramework)\NativeMedia.Avalonia.macOS.dll">
+        <FinalOutputPath>$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.macOS\bin\$(Configuration)\$(TargetFramework)\NativeMedia.Avalonia.macOS.dll</FinalOutputPath>
+        <TargetPath>NativeMedia.Avalonia.macOS.dll</TargetPath>
+        <TargetFramework>$(TargetFramework)</TargetFramework>
+      </BuildOutputInPackage>
+      <BuildOutputInPackage Include="$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.macOS\bin\$(Configuration)\$(TargetFramework)\NativeMedia.Avalonia.macOS.xml" Condition="Exists('$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.macOS\bin\$(Configuration)\$(TargetFramework)\NativeMedia.Avalonia.macOS.xml')">
+        <FinalOutputPath>$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.macOS\bin\$(Configuration)\$(TargetFramework)\NativeMedia.Avalonia.macOS.xml</FinalOutputPath>
+        <TargetPath>NativeMedia.Avalonia.macOS.xml</TargetPath>
+        <TargetFramework>$(TargetFramework)</TargetFramework>
+      </BuildOutputInPackage>
+    </ItemGroup>
+  </Target>
+
+  <!-- Optional source snapshot in the package / 包内附带可选源码快照 -->
+  <ItemGroup>
+    <None Include="$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia\**\*.cs" Exclude="$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia\bin\**\*;$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia\obj\**\*" Pack="true" PackagePath="src\NativeMedia.Avalonia" />
+    <None Include="$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.Windows\**\*.cs" Exclude="$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.Windows\gen\**\*;$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.Windows\bin\**\*;$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.Windows\obj\**\*" Pack="true" PackagePath="src\NativeMedia.Avalonia.Windows" />
+    <None Include="$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.Linux\**\*.cs" Exclude="$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.Linux\bin\**\*;$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.Linux\obj\**\*" Pack="true" PackagePath="src\NativeMedia.Avalonia.Linux" />
+    <None Include="$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.macOS\**\*.cs" Exclude="$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.macOS\bin\**\*;$(MSBuildProjectDirectory)\..\NativeMedia.Avalonia.macOS\obj\**\*" Pack="true" PackagePath="src\NativeMedia.Avalonia.macOS" />
+    <Content Include="$(MSBuildProjectDirectory)\Themes\**\*.axaml" Pack="true" PackagePath="src\NativeMedia.Avalonia\Themes" />
+  </ItemGroup>
+
+</Project>

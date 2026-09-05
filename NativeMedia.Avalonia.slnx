@@ -1,0 +1,16 @@
+<Solution>
+  <Folder Name="/samples/">
+    <Project Path="samples/NativeMedia.Avalonia.Demo/NativeMedia.Avalonia.Demo.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/NativeMedia.Avalonia.Linux/NativeMedia.Avalonia.Linux.csproj" />
+    <Project Path="src/NativeMedia.Avalonia.macOS/NativeMedia.Avalonia.macOS.csproj" />
+    <Project Path="src/NativeMedia.Avalonia.Windows/NativeMedia.Avalonia.Windows.csproj" />
+    <Project Path="src/NativeMedia.Avalonia/NativeMedia.Avalonia.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/NativeMedia.Avalonia.AotSmoke/NativeMedia.Avalonia.AotSmoke.csproj" />
+    <Project Path="tests/NativeMedia.Avalonia.LinuxSmoke/NativeMedia.Avalonia.LinuxSmoke.csproj" />
+    <Project Path="tests/NativeMedia.Avalonia.Tests/NativeMedia.Avalonia.Tests.csproj" />
+  </Folder>
+</Solution>

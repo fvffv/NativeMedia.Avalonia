@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <PublishAot>true</PublishAot>
+    <PublishTrimmed>true</PublishTrimmed>
+    <NoWarn>$(NoWarn);CA1416;IL2050</NoWarn>
+  </PropertyGroup>
+  <ItemGroup><ProjectReference Include="..\..\src\NativeMedia.Avalonia.Windows\NativeMedia.Avalonia.Windows.csproj" /></ItemGroup>
+</Project>
