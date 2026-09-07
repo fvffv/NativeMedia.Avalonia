@@ -40,8 +40,14 @@ public sealed class VolumeChangedEventArgs(double volume) : EventArgs
 }
 
 /// <summary>新视频帧事件参数。<para>Event data for a newly decoded video frame.</para></summary>
-public sealed class VideoFrameEventArgs(global::Avalonia.Media.Imaging.Bitmap frame) : EventArgs
+public sealed class VideoFrameEventArgs(global::Avalonia.Media.Imaging.Bitmap frame, TimeSpan? position = null, long capturedTimestamp = 0, ulong contentHash = 0) : EventArgs
 {
     /// <summary>解码后的视频帧。<para>Decoded video frame.</para></summary>
     public global::Avalonia.Media.Imaging.Bitmap Frame { get; } = frame;
+    /// <summary>该帧对应的媒体时间；后端无法提供时为 null。<para>Media timestamp of the frame, or null when unavailable.</para></summary>
+    public TimeSpan? Position { get; } = position;
+    /// <summary>帧被后端发布时的单调时钟时间戳。<para>Monotonic timestamp captured when the backend published the frame.</para></summary>
+    public long CapturedTimestamp { get; } = capturedTimestamp;
+    /// <summary>帧内容指纹，用于确认 Seek 后确实收到新画面。<para>Frame content fingerprint used to confirm a new picture after seeking.</para></summary>
+    public ulong ContentHash { get; } = contentHash;
 }

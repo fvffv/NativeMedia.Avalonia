@@ -5,29 +5,67 @@ using System.Diagnostics;
 using NativeMedia.Avalonia;
 using Avalonia;
 using global::Avalonia.Media.Imaging;
+using global::Avalonia.Threading;
 
 namespace NativeMedia.Avalonia.Windows;
 
 /// <summary>Media Foundation MFPlay adapter. It uses raw COM vtable calls, which are NativeAOT-safe.</summary>
 [SupportedOSPlatform("windows6.1")]
-public sealed class WindowsMediaFoundationBackend : NativeMediaBackend
+public sealed class WindowsMediaFoundationBackend : NativeMediaBackend, IVideoMediaBackend, IVideoQualityMediaBackend, IVideoFrameClockBackend
 {
     private nint _player;
     private nint _videoOutput;
     private nint _captureWindow;
     private Timer? _captureTimer;
     private long _captureNotBefore;
-    private readonly byte[] _captureBuffer = new byte[CaptureWidth * CaptureHeight * 4];
-    private const int CaptureWidth = 960;
-    private const int CaptureHeight = 540;
+    private byte[] _captureBuffer = [];
+    private int _captureWidth = 1;
+    private int _captureHeight = 1;
+    private VideoPlaybackQuality _playbackQuality = VideoPlaybackQuality.Original;
+    private bool _externalFrameClock;
+    private int _captureQueued;
+    private int _captureGeneration;
+    private long _lastCaptureTimestamp;
     private bool _mfStarted;
     private bool _comInitialized;
     private string? _source;
     private Timer? _durationPoller;
+    private bool _videoOutputEnabled = true;
     private static readonly Guid PositionType100Ns = Guid.Empty;
 
     public WindowsMediaFoundationBackend() : base("Windows Media Foundation", OperatingSystem.IsWindows()) { }
-    public override bool RequiresUiThreadOpen => true;
+    public override bool RequiresUiThreadOpen => _videoOutputEnabled;
+    public void ConfigureVideoOutput(bool enabled) => _videoOutputEnabled = enabled;
+    /// <inheritdoc />
+    public Task SetPlaybackQualityAsync(VideoPlaybackQuality quality, CancellationToken cancellationToken = default)
+    {
+        _ = VideoPlaybackProfile.FromQuality(quality);
+        cancellationToken.ThrowIfCancellationRequested();
+        _playbackQuality = quality;
+        _lastCaptureTimestamp = 0;
+        return Task.CompletedTask;
+    }
+
+    /// <inheritdoc />
+    public void SetExternalFrameClock(bool enabled)
+    {
+        _externalFrameClock = enabled;
+        _captureTimer?.Change(enabled ? Timeout.Infinite : 0, 1);
+    }
+
+    /// <inheritdoc />
+    public void RequestVideoFrame()
+    {
+        if (!_videoOutputEnabled || _player == 0 || Interlocked.Exchange(ref _captureQueued, 1) != 0) return;
+        var generation = _captureGeneration;
+        // HWND resizing/capture stays on its owning thread, outside Avalonia's
+        // render pass. Only one request may be pending at a time.
+        Dispatcher.UIThread.Post(() =>
+        {
+            try { if (generation == _captureGeneration) CaptureVideoFrame(); }
+            finally { Volatile.Write(ref _captureQueued, 0); }
+        }, DispatcherPriority.Background);
+    }
 
     public override async Task OpenAsync(string source, CancellationToken cancellationToken = default)
     {
@@ -36,18 +74,26 @@ public sealed class WindowsMediaFoundationBackend : NativeMediaBackend
         {
             CloseNativePlayer();
             _source = source;
-            _comInitialized = NativeMethods.CoInitializeEx(IntPtr.Zero, 2) >= 0;
+            _comInitialized = NativeMethods.CoInitializeEx(IntPtr.Zero, _videoOutputEnabled ? 2u : 0u) >= 0;
             if (NativeMethods.MFStartup(0x00020070, 0) < 0) { RaiseError("Media Foundation initialization failed."); return; }
             _mfStarted = true;
-            _captureWindow = NativeMethods.CreateCaptureWindow(CaptureWidth, CaptureHeight);
+            _captureWidth = _captureHeight = 1;
+            _captureBuffer = [];
+            _lastCaptureTimestamp = 0;
+            _captureWindow = _videoOutputEnabled ? NativeMethods.CreateCaptureWindow(1, 1) : 0;
             var hr = CreateNativePlayer(source);
             if (hr < 0 || _player == 0) { RaiseError($"Media Foundation could not open the media (HRESULT 0x{hr:X8})."); return; }
             await base.OpenAsync(source, cancellationToken);
             TryReadDuration();
             RaisePositionChanged();
             if (Duration <= TimeSpan.Zero) _durationPoller = new Timer(_ => TryReadDuration(), null, 200, 250);
-            _captureTimer = new Timer(_ => CaptureVideoFrame(), null, 100, 33);
-            _captureNotBefore = Stopwatch.GetTimestamp() + Stopwatch.Frequency * 3 / 4;
+            if (_videoOutputEnabled)
+            {
+                // Controls use the host display clock (including high-refresh
+                // displays); this timer is only for standalone backend callers.
+                _captureTimer = new Timer(_ => RequestVideoFrame(), null, _externalFrameClock ? Timeout.Infinite : 100, 1);
+                _captureNotBefore = Stopwatch.GetTimestamp() + Stopwatch.Frequency * 3 / 4;
+            }
         }
         catch (DllNotFoundException ex) { RaiseError("Media Foundation is not available.", ex); }
     }
@@ -98,6 +144,7 @@ public sealed class WindowsMediaFoundationBackend : NativeMediaBackend
     public override bool Muted { get => base.Muted; set { base.Muted = value; if (_player != 0) InvokeBool(24, value); } }
     public override void SetVideoOutput(nint handle)
     {
+        if (!_videoOutputEnabled) return;
         if (handle == _videoOutput) return;
         var hadOutput = _videoOutput != 0;
         _videoOutput = handle;
@@ -120,10 +167,32 @@ public sealed class WindowsMediaFoundationBackend : NativeMediaBackend
     private int CreateNativePlayer(string source)
     {
         var uri = Uri.TryCreate(source, UriKind.Absolute, out var existing) && existing.Scheme is "http" or "https" or "file" ? source : new Uri(Path.GetFullPath(source)).AbsoluteUri;
-        var result = NativeMethods.MFPCreateMediaPlayer(uri, 0, 0, 0, _captureWindow, out _player);
-        if (_captureWindow != 0) NativeMethods.KeepCaptureWindow(_captureWindow, CaptureWidth, CaptureHeight);
+        // Audio runs on a background MTA without a Win32 message loop. MFPlay's
+        // default dispatch requires such a loop even when no callback is supplied.
+        const int FreeThreadedCallback = 1;
+        var result = NativeMethods.MFPCreateMediaPlayer(uri, 0,
+            _videoOutputEnabled ? 0 : FreeThreadedCallback, 0, _captureWindow, out _player);
+        if (_captureWindow != 0) NativeMethods.KeepCaptureWindow(_captureWindow, _captureWidth, _captureHeight);
         return result;
     }
+
+    private unsafe bool RefreshVideoSize()
+    {
+        if (_player == 0 || _captureWindow == 0) return false;
+        NativeSize source = default;
+        var table = *(nint**)_player;
+        var hr = ((delegate* unmanaged[Stdcall]<nint, NativeSize*, NativeSize*, int>)table[25])(_player, &source, null);
+        if (hr < 0 || source.Width <= 0 || source.Height <= 0) return false;
+        var size = VideoPlaybackProfile.FromQuality(_playbackQuality).GetOutputSize(source.Width, source.Height);
+        if (_captureWidth == size.Width && _captureHeight == size.Height && _captureBuffer.Length > 0) return true;
+        _captureBuffer = new byte[checked(size.Width * size.Height * 4)];
+        _captureWidth = size.Width;
+        _captureHeight = size.Height;
+        NativeMethods.KeepCaptureWindow(_captureWindow, _captureWidth, _captureHeight);
+        InvokeVoid(32); // IMFPMediaPlayer.UpdateVideo after changing the target HWND size.
+        return true;
+    }
+
     private void CaptureVideoFrame()
     {
         if (_captureWindow == 0 || _player == 0) return;
@@ -131,10 +200,49 @@ public sealed class WindowsMediaFoundationBackend : NativeMediaBackend
         if (Stopwatch.GetTimestamp() < _captureNotBefore) return;
         try
         {
-            var frame = NativeMethods.CaptureWindow(_captureWindow, CaptureWidth, CaptureHeight, _captureBuffer);
-            if (frame is not null) RaiseVideoFrame(frame);
+            var now = Stopwatch.GetTimestamp();
+            var maximumFrameRate = VideoPlaybackProfile.FromQuality(_playbackQuality).MaximumFrameRate;
+            if (maximumFrameRate > 0 && _lastCaptureTimestamp != 0
+                && Stopwatch.GetElapsedTime(_lastCaptureTimestamp, now).TotalSeconds < 1d / maximumFrameRate - 0.001)
+                return;
+            if (!RefreshVideoSize()) return;
+            var frame = NativeMethods.CaptureWindow(_captureWindow, _captureWidth, _captureHeight, _captureBuffer);
+            if (frame is not null)
+            {
+                var hash = ComputeFrameHash(_captureBuffer);
+                if (IsBlankCapture(_captureBuffer))
+                {
+                    frame.Dispose();
+                    return;
+                }
+                _lastCaptureTimestamp = now;
+                RaiseVideoFrame(frame, Position, hash);
+            }
         }
         catch { }
+    }
+    private static ulong ComputeFrameHash(ReadOnlySpan<byte> bytes)
+    {
+        // Sample the full BGRA buffer at a fixed stride. This is inexpensive
+        // enough for capture cadence and distinguishes stale pre-seek frames.
+        const ulong offset = 14695981039346656037;
+        const ulong prime = 1099511628211;
+        var hash = offset;
+        var step = Math.Max(4, bytes.Length / 2048);
+        for (var i = 0; i < bytes.Length; i += step) hash = (hash ^ bytes[i]) * prime;
+        return hash;
+    }
+    private static bool IsBlankCapture(ReadOnlySpan<byte> bytes)
+    {
+        var step = Math.Max(4, bytes.Length / 1024);
+        var first = bytes[0];
+        var different = 0;
+        for (var i = 0; i < bytes.Length; i += step)
+        {
+            if (Math.Abs(bytes[i] - first) > 3) different++;
+            if (different >= 8) return false;
+        }
+        return true;
     }
     private unsafe void InvokeVoid(int index) { if (_player == 0) return; var table = *(nint**)_player; ((delegate* unmanaged[Stdcall]<nint, int>)table[index])(_player); }
     private unsafe void InvokeFloat(int index, float value) { var table = *(nint**)_player; ((delegate* unmanaged[Stdcall]<nint, float, int>)table[index])(_player, value); }
@@ -144,11 +252,14 @@ public sealed class WindowsMediaFoundationBackend : NativeMediaBackend
     private unsafe void InvokeGetDuration(Guid* type, RawPropVariant* value) { var table = *(nint**)_player; ((delegate* unmanaged[Stdcall]<nint, Guid*, RawPropVariant*, int>)table[9])(_player, type, value); }
     private void CloseNativePlayer()
     {
+        _captureGeneration++;
         _durationPoller?.Dispose();
         _durationPoller = null;
         _captureTimer?.Dispose();
         _captureTimer = null;
         if (_player != 0) { try { InvokeVoid(38); InvokeVoid(2); } catch { } _player = 0; }
+        if (_captureWindow != 0) { NativeMethods.DestroyWindow(_captureWindow); _captureWindow = 0; }
+        _captureBuffer = [];
     }
     public override void Dispose()
     {
@@ -159,6 +270,7 @@ public sealed class WindowsMediaFoundationBackend : NativeMediaBackend
         if (_comInitialized) { NativeMethods.CoUninitialize(); _comInitialized = false; }
     }
     [StructLayout(LayoutKind.Explicit, Size = 24)] private struct RawPropVariant { [FieldOffset(0)] public ushort Type; [FieldOffset(8)] public long HValue; }
+    [StructLayout(LayoutKind.Sequential)] private struct NativeSize { public int Width, Height; }
     private static class NativeMethods
     {
         [DllImport("mfplat.dll", ExactSpelling = true)] public static extern int MFStartup(uint version, uint flags);

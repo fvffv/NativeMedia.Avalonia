@@ -11,7 +11,7 @@ namespace NativeMedia.Avalonia.macOS;
 /// are copied from CoreVideo into Avalonia so normal Avalonia controls can be
 /// composited above the video.
 /// </summary>
-public sealed class MacAvFoundationBackend : NativeMediaBackend
+public sealed class MacAvFoundationBackend : NativeMediaBackend, IVideoMediaBackend, IVideoQualityMediaBackend, IVideoFrameClockBackend
 {
     private const uint PixelFormat32Bgra = 0x42475241; // 'BGRA'
     private readonly object _nativeGate = new();
@@ -23,8 +23,47 @@ public sealed class MacAvFoundationBackend : NativeMediaBackend
     private byte[] _rowBuffer = [];
     private int _readingFrame;
     private bool _disposed;
+    private bool _videoOutputEnabled = true;
+    private VideoPlaybackQuality _playbackQuality = VideoPlaybackQuality.Original;
+    private bool _externalFrameClock;
+    private int _frameRequestQueued;
+    private TimeSpan? _lastPublishedFramePosition;
 
-    public MacAvFoundationBackend() : base("macOS AVFoundation", OperatingSystem.IsMacOS() && CheckFramework()) { }
+    public MacAvFoundationBackend() : base("macOS AVFoundation", OperatingSystem.IsMacOS()) { }
+    public void ConfigureVideoOutput(bool enabled) => _videoOutputEnabled = enabled;
+    /// <inheritdoc />
+    public Task SetPlaybackQualityAsync(VideoPlaybackQuality quality, CancellationToken cancellationToken = default)
+    {
+        _ = VideoPlaybackProfile.FromQuality(quality);
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_nativeGate)
+        {
+            _playbackQuality = quality;
+            _lastPublishedFramePosition = null;
+        }
+        return Task.CompletedTask;
+    }
+
+    /// <inheritdoc />
+    public void SetExternalFrameClock(bool enabled)
+    {
+        lock (_nativeGate)
+        {
+            _externalFrameClock = enabled;
+            _frameTimer?.Change(enabled ? Timeout.Infinite : 0, 1);
+        }
+    }
+
+    /// <inheritdoc />
+    public void RequestVideoFrame()
+    {
+        if (_disposed || !_videoOutputEnabled || Interlocked.Exchange(ref _frameRequestQueued, 1) != 0) return;
+        _ = Task.Run(() =>
+        {
+            try { PullVideoFrame(); }
+            finally { Volatile.Write(ref _frameRequestQueued, 0); }
+        });
+    }
 
     public static bool CheckFramework()
         => OperatingSystem.IsMacOS()
@@ -41,7 +80,7 @@ public sealed class MacAvFoundationBackend : NativeMediaBackend
 
     public override async Task OpenAsync(string source, CancellationToken cancellationToken = default)
     {
-        if (!IsAvailable)
+        if (!IsAvailable || !CheckFramework())
         {
             RaiseError("AVFoundation is unavailable on this macOS runtime.");
             return;
@@ -70,7 +109,7 @@ public sealed class MacAvFoundationBackend : NativeMediaBackend
                 throw new InvalidOperationException("AVFoundation could not create an AVPlayerItem.");
             Native.SendVoid(_playerItem, Native.Selector("retain"));
 
-            _videoOutput = CreateVideoOutput();
+            _videoOutput = _videoOutputEnabled ? CreateVideoOutput() : 0;
             if (_videoOutput != 0)
                 Native.SendVoid(_playerItem, Native.Selector("addOutput:"), _videoOutput);
 
@@ -83,10 +122,10 @@ public sealed class MacAvFoundationBackend : NativeMediaBackend
             Native.SendVoid(_player, Native.Selector("retain"));
             ApplyVolumeLocked();
 
-            // Poll AVPlayerItemVideoOutput at display cadence. AVPlayer keeps
-            // audio/video synchronized; this timer only transfers ready frames.
+            // The control drives requests at the display's actual refresh rate.
+            // Standalone backends retain an unrestricted fallback polling timer.
             if (_videoOutput != 0)
-                _frameTimer = new Timer(_ => PullVideoFrame(), null, 0, 16);
+                _frameTimer = new Timer(_ => RequestVideoFrame(), null, _externalFrameClock ? Timeout.Infinite : 0, 1);
             _durationTimer = new Timer(_ => PollDuration(), null, 100, 250);
         }
 
@@ -149,6 +188,7 @@ public sealed class MacAvFoundationBackend : NativeMediaBackend
         lock (_nativeGate)
         {
             if (_disposed) return;
+            _lastPublishedFramePosition = null;
             if (_player != 0)
             {
                 var target = Native.CMTimeMakeWithSeconds(Math.Max(0, position.TotalSeconds), 600);
@@ -174,15 +214,7 @@ public sealed class MacAvFoundationBackend : NativeMediaBackend
 
     public override TimeSpan Duration
     {
-        get
-        {
-            lock (_nativeGate)
-            {
-                if (_disposed || _playerItem == 0) return base.Duration;
-                var duration = Native.SendTimeResult(_playerItem, Native.Selector("duration")).ToTimeSpan();
-                return duration > TimeSpan.Zero ? duration : base.Duration;
-            }
-        }
+        get => base.Duration;
         protected set => base.Duration = value;
     }
 
@@ -241,6 +273,8 @@ public sealed class MacAvFoundationBackend : NativeMediaBackend
     {
         if (Interlocked.Exchange(ref _readingFrame, 1) != 0) return;
         nint pixelBuffer = 0;
+        var framePosition = TimeSpan.Zero;
+        VideoPlaybackProfile profile = default;
         try
         {
             lock (_nativeGate)
@@ -253,14 +287,21 @@ public sealed class MacAvFoundationBackend : NativeMediaBackend
                 if (!itemTime.IsValid
                     || !Native.SendBoolForTime(_videoOutput, Native.Selector("hasNewPixelBufferForItemTime:"), itemTime))
                     return;
+                framePosition = itemTime.ToTimeSpan();
+                profile = VideoPlaybackProfile.FromQuality(_playbackQuality);
+                if (profile.MaximumFrameRate > 0 && _lastPublishedFramePosition is { } previous
+                    && framePosition >= previous
+                    && (framePosition - previous).TotalSeconds < 1d / profile.MaximumFrameRate - 0.001)
+                    return;
                 pixelBuffer = Native.SendPixelBuffer(
                     _videoOutput,
                     Native.Selector("copyPixelBufferForItemTime:itemTimeForDisplay:"),
                     itemTime,
                     0);
+                if (pixelBuffer != 0) _lastPublishedFramePosition = framePosition;
             }
 
-            if (pixelBuffer != 0) PublishPixelBuffer(pixelBuffer);
+            if (pixelBuffer != 0) PublishPixelBuffer(pixelBuffer, framePosition, profile);
         }
         catch (Exception ex)
         {
@@ -273,7 +314,7 @@ public sealed class MacAvFoundationBackend : NativeMediaBackend
         }
     }
 
-    private void PublishPixelBuffer(nint pixelBuffer)
+    private void PublishPixelBuffer(nint pixelBuffer, TimeSpan framePosition, VideoPlaybackProfile profile)
     {
         if (Native.CVPixelBufferGetPixelFormatType(pixelBuffer) != PixelFormat32Bgra) return;
         if (Native.CVPixelBufferLockBaseAddress(pixelBuffer, 1) != 0) return;
@@ -305,12 +346,43 @@ public sealed class MacAvFoundationBackend : NativeMediaBackend
                     Marshal.Copy(_rowBuffer, 0, locked.Address + y * locked.RowBytes, copyRowBytes);
                 }
             }
-            RaiseVideoFrame(bitmap);
+            var hash = ComputeFrameHash(bitmap);
+            var outputSize = profile.GetOutputSize(width, height);
+            if (outputSize == bitmap.PixelSize)
+                RaiseVideoFrame(bitmap, framePosition, hash);
+            else
+            {
+                try
+                {
+                    var scaled = bitmap.CreateScaledBitmap(outputSize, BitmapInterpolationMode.HighQuality);
+                    RaiseVideoFrame(scaled, framePosition, hash);
+                }
+                finally { bitmap.Dispose(); }
+            }
         }
         finally
         {
             Native.CVPixelBufferUnlockBaseAddress(pixelBuffer, 1);
         }
+    }
+
+    private static ulong ComputeFrameHash(WriteableBitmap bitmap)
+    {
+        const ulong offset = 14695981039346656037;
+        const ulong prime = 1099511628211;
+        var hash = offset;
+        using var locked = bitmap.Lock();
+        var height = bitmap.PixelSize.Height;
+        var rowBytes = Math.Min(locked.RowBytes, bitmap.PixelSize.Width * 4);
+        var sample = new byte[Math.Max(1, rowBytes)];
+        var rowStep = Math.Max(1, height / 32);
+        var columnStep = Math.Max(4, rowBytes / 64);
+        for (var y = 0; y < height; y += rowStep)
+        {
+            Marshal.Copy(locked.Address + y * locked.RowBytes, sample, 0, rowBytes);
+            for (var x = 0; x < rowBytes; x += columnStep) hash = (hash ^ sample[x]) * prime;
+        }
+        return hash;
     }
 
     public override void Dispose()
@@ -326,6 +398,7 @@ public sealed class MacAvFoundationBackend : NativeMediaBackend
 
     private void CloseNativePlayerLocked()
     {
+        _lastPublishedFramePosition = null;
         _frameTimer?.Dispose();
         _frameTimer = null;
         _durationTimer?.Dispose();

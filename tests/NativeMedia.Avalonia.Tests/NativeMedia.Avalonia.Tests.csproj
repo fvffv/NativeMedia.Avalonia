@@ -9,6 +9,7 @@
   </PropertyGroup>
   <ItemGroup><ProjectReference Include="..\..\src\NativeMedia.Avalonia\NativeMedia.Avalonia.csproj" /></ItemGroup>
   <ItemGroup><ProjectReference Include="..\..\src\NativeMedia.Avalonia.Windows\NativeMedia.Avalonia.Windows.csproj" /></ItemGroup>
+  <ItemGroup><ProjectReference Include="..\..\src\NativeMedia.Avalonia.Linux\NativeMedia.Avalonia.Linux.csproj" /></ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="coverlet.collector" Version="6.0.4" />

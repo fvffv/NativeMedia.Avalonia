@@ -72,7 +72,8 @@ public class NativeMediaBackend : IMediaBackend
 
     private void PollPosition() { lock (_gate) { if (_disposed || _state != MediaState.Playing) return; UpdateClock(); var p = _position; PositionChanged?.Invoke(this, new(p)); } }
     protected void RaisePositionChanged() => PositionChanged?.Invoke(this, new(Position));
-    protected void RaiseVideoFrame(global::Avalonia.Media.Imaging.Bitmap frame) => VideoFrameAvailable?.Invoke(this, new(frame));
+    protected void RaiseVideoFrame(global::Avalonia.Media.Imaging.Bitmap frame, TimeSpan? position = null, ulong contentHash = 0)
+        => VideoFrameAvailable?.Invoke(this, new(frame, position, Stopwatch.GetTimestamp(), contentHash));
     protected void RaiseEndedFromBackend()
     {
         lock (_gate) { _position = _duration; _state = MediaState.Ended; _clock.Stop(); }

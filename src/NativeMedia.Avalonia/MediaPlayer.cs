@@ -1,9 +1,14 @@
+using System.Diagnostics;
+using System.Collections.Concurrent;
 using Avalonia;
 using global::Avalonia.Controls;
 using global::Avalonia.Controls.Primitives;
 using global::Avalonia.Input;
 using global::Avalonia.Interactivity;
+using global::Avalonia.Media;
+using global::Avalonia.Controls.Shapes;
 using global::Avalonia.Threading;
+using SvgPath = global::Avalonia.Controls.Shapes.Path;
 
 namespace NativeMedia.Avalonia;
 
@@ -22,6 +27,10 @@ public abstract class MediaPlayer : TemplatedControl, IAsyncDisposable, IDisposa
     public static readonly StyledProperty<bool> ShowControlsProperty = AvaloniaProperty.Register<MediaPlayer, bool>(nameof(ShowControls), true);
     /// <summary>注册循环播放属性。<para>Registered loop property.</para></summary>
     public static readonly StyledProperty<bool> LoopProperty = AvaloniaProperty.Register<MediaPlayer, bool>(nameof(Loop));
+    /// <summary>注册播放质量属性，默认原画。<para>Registered playback quality, defaulting to Original.</para></summary>
+    public static readonly StyledProperty<VideoPlaybackQuality> PlaybackQualityProperty =
+        AvaloniaProperty.Register<MediaPlayer, VideoPlaybackQuality>(nameof(PlaybackQuality), VideoPlaybackQuality.Original,
+            validate: static value => Enum.IsDefined(value));
     /// <summary>注册播放位置属性。<para>Registered playback position property.</para></summary>
     public static readonly DirectProperty<MediaPlayer, TimeSpan> PositionProperty = AvaloniaProperty.RegisterDirect<MediaPlayer, TimeSpan>(nameof(Position), p => p.Position, (p, v) => p.SetPosition(v));
     /// <summary>注册媒体时长属性。<para>Registered media duration property.</para></summary>
@@ -66,8 +75,11 @@ public abstract class MediaPlayer : TemplatedControl, IAsyncDisposable, IDisposa
     public static readonly DirectProperty<MediaPlayer, string> RuntimeStatusProperty = AvaloniaProperty.RegisterDirect<MediaPlayer, string>(nameof(RuntimeStatus), p => p.RuntimeStatus);
     /// <summary>注册运行状态提示显隐属性。<para>Registered runtime-status visibility property.</para></summary>
     public static readonly DirectProperty<MediaPlayer, bool> RuntimeStatusVisibleProperty = AvaloniaProperty.RegisterDirect<MediaPlayer, bool>(nameof(RuntimeStatusVisible), p => p.RuntimeStatusVisible);
+    /// <summary>注册缓冲/打开状态属性。<para>Registered buffering/opening state property.</para></summary>
+    public static readonly DirectProperty<MediaPlayer, bool> IsBufferingProperty = AvaloniaProperty.RegisterDirect<MediaPlayer, bool>(nameof(IsBuffering), p => p.IsBuffering);
 
     private readonly IMediaBackend _backend;
+    private readonly BackendWorker? _backendWorker;
     private bool _updating;
     private TimeSpan _position, _duration, _buffered;
     private bool _isPlaying;
@@ -83,10 +95,49 @@ public abstract class MediaPlayer : TemplatedControl, IAsyncDisposable, IDisposa
     private string _runtimeStatus = string.Empty;
     private bool _suppressSourceOpen;
     private int _openGeneration;
+    private readonly object _seekBufferGate = new();
+    private TaskCompletionSource? _seekReady;
+    private bool _seekBuffering;
+    private long _seekStartedTimestamp;
+    private TimeSpan _seekTarget;
+    private TimeSpan _seekOrigin;
+    private ulong _seekOriginFrameContentHash;
+    private int _seekGeneration;
+    private const int SeekIndicatorMinimumMilliseconds = 140;
+    private const int SeekIndicatorTimeoutMilliseconds = 2500;
+    private bool _awaitingFirstVideoFrame;
+    private bool _networkBuffering;
+    private bool _videoFrameNeedsRender;
+    private long _firstVideoFrameWaitStartedTimestamp;
+    private long _lastRenderedFrameTimestamp;
+    private long _lastPlaybackProgressTimestamp;
+    private TimeSpan? _lastRenderedProgressPosition;
+    private TimeSpan _lastObservedAudioPosition;
+    private ulong _lastRenderedProgressContentHash;
+    private TimeSpan? _lastVideoFramePosition;
+    private long _lastVideoFrameCapturedTimestamp;
+    private ulong _lastVideoFrameContentHash;
+    private VideoFrameSurface? _videoFrameSurface;
+    private TopLevel? _frameClockHost;
+    private bool _frameClockScheduled;
+    private readonly object _pendingFrameGate = new();
+    private VideoFrameEventArgs? _pendingVideoFrame;
+    private bool _frameDeliveryScheduled;
+    private DispatcherTimer? _bufferingMonitor;
+    private const int NetworkBufferingThresholdMilliseconds = 700;
+    private bool _playbackOperationBuffering;
     private WindowState _previousWindowState = WindowState.Normal;
     private Window? _hostWindow;
 
-    protected MediaPlayer() { _backend = MediaBackendFactory.Create(); Subscribe(_backend); }
+    protected MediaPlayer()
+    {
+        _backend = MediaBackendFactory.Create();
+        if (_backend is IVideoMediaBackend configurable)
+            configurable.ConfigureVideoOutput(this is VideoPlayer);
+        if (!_backend.RequiresUiThreadOpen)
+            _backendWorker = new BackendWorker(GetType().Name + ".MediaBackend");
+        Subscribe(_backend);
+    }
     /// <summary>当前注册的平台后端名称。<para>Name of the registered platform backend.</para></summary>
     public string BackendName => _backend.Name;
     /// <summary>当前平台播放运行时是否可用。<para>Whether the selected platform runtime is available.</para></summary>
@@ -103,6 +154,8 @@ public abstract class MediaPlayer : TemplatedControl, IAsyncDisposable, IDisposa
     public bool ShowControls { get => GetValue(ShowControlsProperty); set => SetValue(ShowControlsProperty, value); }
     /// <summary>播放结束后是否从头循环。<para>Whether to restart playback when the media ends.</para></summary>
     public bool Loop { get => GetValue(LoopProperty); set => SetValue(LoopProperty, value); }
+    /// <summary>视频输出质量，支持绑定和播放中切换；原画不主动降低分辨率或帧率。<para>Bindable video quality; Original applies no resolution or frame-rate reduction.</para></summary>
+    public VideoPlaybackQuality PlaybackQuality { get => GetValue(PlaybackQualityProperty); set => SetValue(PlaybackQualityProperty, value); }
     /// <summary>当前播放位置；通过 Avalonia TwoWay Binding 可写入。<para>Current playback position; writable through Avalonia TwoWay Binding.</para></summary>
     public TimeSpan Position => _position;
     /// <summary>媒体总时长。<para>Total media duration.</para></summary>
@@ -147,6 +200,8 @@ public abstract class MediaPlayer : TemplatedControl, IAsyncDisposable, IDisposa
     public string RuntimeStatus => _runtimeStatus;
     /// <summary>是否有运行状态提示需要显示。<para>Whether a runtime status message should be displayed.</para></summary>
     public bool RuntimeStatusVisible => !string.IsNullOrWhiteSpace(_runtimeStatus);
+    /// <summary>当前是否正在打开媒体或等待首批数据；可用于显示缓冲动画。<para>Whether the media is opening or waiting for initial data; useful for showing a buffering indicator.</para></summary>
+    public bool IsBuffering => _state == MediaState.Loading || _seekBuffering || _awaitingFirstVideoFrame || _networkBuffering || _playbackOperationBuffering;
     /// <summary>用户请求进入或退出全屏时触发。<para>Raised when the user requests entering or exiting fullscreen.</para></summary>
     public event EventHandler? FullScreenRequested;
     /// <summary>媒体成功打开后触发。<para>Raised after the media is opened successfully.</para></summary>
@@ -170,10 +225,16 @@ public abstract class MediaPlayer : TemplatedControl, IAsyncDisposable, IDisposa
     {
         base.OnPropertyChanged(change);
         if (change.Property == SourceProperty && !_suppressSourceOpen) StartOpenSource(change.NewValue as string);
-        else if (change.Property == VolumeProperty && !_updating && Math.Abs(change.GetNewValue<double>() - _backend.Volume) > 0.001) _backend.Volume = Volume;
+        else if (change.Property == PlaybackQualityProperty && this is VideoPlayer)
+        {
+            var quality = change.GetNewValue<VideoPlaybackQuality>();
+            _ = ApplyPlaybackQualityAsync(quality);
+        }
+        else if (change.Property == VolumeProperty && !_updating && Math.Abs(change.GetNewValue<double>() - _backend.Volume) > 0.001)
+            _ = RunBackendActionAsync(backend => backend.Volume = Volume);
         else if (change.Property == MutedProperty && !_updating && change.GetNewValue<bool>() != _backend.Muted)
         {
-            _backend.Muted = Muted;
+            _ = RunBackendActionAsync(backend => backend.Muted = Muted);
             UpdateTemplateParts();
         }
         else if (change.Property == ShowControlsProperty)
@@ -183,6 +244,19 @@ public abstract class MediaPlayer : TemplatedControl, IAsyncDisposable, IDisposa
         }
     }
     private Task OpenSourceAsync(string? source) => OpenSourceAsync(source, CancellationToken.None, _openGeneration);
+    private async Task ApplyPlaybackQualityAsync(VideoPlaybackQuality quality)
+    {
+        try
+        {
+            await RunBackendOperationAsync(backend => backend is IVideoQualityMediaBackend configurable
+                ? configurable.SetPlaybackQualityAsync(quality)
+                : Task.CompletedTask);
+        }
+        catch (Exception ex)
+        {
+            if (!_disposed) OnUi(() => Error?.Invoke(this, new MediaErrorEventArgs("Could not change playback quality: " + ex.Message, ex)));
+        }
+    }
     private async Task OpenSourceAsync(string? source, CancellationToken cancellationToken, int generation)
     {
         if (_disposed || string.IsNullOrWhiteSpace(source)) return;
@@ -190,6 +264,8 @@ public abstract class MediaPlayer : TemplatedControl, IAsyncDisposable, IDisposa
         var oldKind = SourceKind;
         try
         {
+            if (this is VideoPlayer) BeginFirstVideoFrameWait();
+            else SetPlaybackOperationBuffering(true);
             SetState(MediaState.Loading);
 
             // Most backends can perform synchronous startup away from the UI
@@ -197,26 +273,37 @@ public abstract class MediaPlayer : TemplatedControl, IAsyncDisposable, IDisposa
             // is the exception: its hidden HWND/message pump must stay on the
             // native UI thread, so Source changes are deferred until the host
             // window has had a chance to render before that short setup runs.
-            if (_backend.RequiresUiThreadOpen)
-                await _backend.OpenAsync(source, cancellationToken);
-            else
-                await Task.Run(() => _backend.OpenAsync(source, cancellationToken), cancellationToken);
+            var quality = PlaybackQuality;
+            await RunBackendOperationAsync(async backend =>
+            {
+                if (this is VideoPlayer && backend is IVideoQualityMediaBackend configurable)
+                    await configurable.SetPlaybackQualityAsync(quality, cancellationToken);
+                await backend.OpenAsync(source, cancellationToken);
+            });
 
             if (generation != _openGeneration || _disposed) return;
             RaisePropertyChanged(IsStreamingProperty, oldStreaming, IsStreaming);
             RaisePropertyChanged(SourceKindProperty, oldKind, SourceKind);
-            if (State == MediaState.Ready && AutoPlay) await PlayAsync();
+            if (this is AudioPlayer) SetPlaybackOperationBuffering(false);
+            // Opened is posted from the backend worker; its UI notification may
+            // still be queued when this await completes. Use the completed
+            // backend operation's state, not the potentially stale UI mirror.
+            if (_backend.State == MediaState.Ready && AutoPlay) await PlayAsync();
+            else if (_backend.State == MediaState.Ready && this is VideoPlayer) StopBufferingMonitor();
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
+            if (this is AudioPlayer) SetPlaybackOperationBuffering(false);
             // A newer Source value or an explicit cancellation superseded this
             // open request. The newer request owns the player state.
         }
         catch (Exception ex)
         {
+            if (this is AudioPlayer) SetPlaybackOperationBuffering(false);
             if (generation != _openGeneration || _disposed) return;
             OnUi(() =>
             {
+                StopBufferingMonitor();
                 SetState(MediaState.Error);
                 var oldStatus = _runtimeStatus;
                 _runtimeStatus = ex.Message;
@@ -226,8 +313,26 @@ public abstract class MediaPlayer : TemplatedControl, IAsyncDisposable, IDisposa
             });
         }
     }
+    private void BeginFirstVideoFrameWait()
+    {
+        if (this is not VideoPlayer) return;
+        lock (_seekBufferGate)
+        {
+            _awaitingFirstVideoFrame = true;
+            _firstVideoFrameWaitStartedTimestamp = Stopwatch.GetTimestamp();
+            _lastRenderedFrameTimestamp = 0;
+            _lastRenderedProgressPosition = null;
+            _lastRenderedProgressContentHash = 0;
+            _lastVideoFramePosition = null;
+            _lastVideoFrameCapturedTimestamp = 0;
+            _lastVideoFrameContentHash = 0;
+        }
+        OnUi(() => RaisePropertyChanged(IsBufferingProperty, false, IsBuffering));
+        StartBufferingMonitor();
+    }
     private void StartOpenSource(string? source)
     {
+        CancelSeekBuffering();
         var generation = Interlocked.Increment(ref _openGeneration);
         Dispatcher.UIThread.Post(
             () =>
@@ -242,21 +347,109 @@ public abstract class MediaPlayer : TemplatedControl, IAsyncDisposable, IDisposa
     /// <param name="cancellationToken">取消打开操作的令牌。<para>Token used to cancel the open operation.</para></param>
     public async Task OpenAsync(string source, CancellationToken cancellationToken = default)
     {
+        CancelSeekBuffering();
         _suppressSourceOpen = true;
         try { SetCurrentValue(SourceProperty, source); }
         finally { _suppressSourceOpen = false; }
         var generation = Interlocked.Increment(ref _openGeneration);
         await OpenSourceAsync(source, cancellationToken, generation);
     }
-    /// <summary>开始或继续播放。<para>Starts or resumes playback.</para></summary>
-    public Task PlayAsync() => _backend.PlayAsync();
-    /// <summary>暂停播放并保留当前位置。<para>Pauses playback and keeps the current position.</para></summary>
-    public Task PauseAsync() => _backend.PauseAsync();
-    /// <summary>停止播放。<para>Stops playback.</para></summary>
-    public Task StopAsync() => _backend.StopAsync();
+    /// <summary>开始或继续播放；不会阻塞 Avalonia UI 线程。<para>Starts or resumes playback without blocking the Avalonia UI thread.</para></summary>
+    public async Task PlayAsync()
+    {
+        BeginFirstVideoFrameWaitIfNeeded();
+        BeginNetworkPlaybackWait();
+        StartBufferingMonitor();
+        var isAudio = this is AudioPlayer;
+        if (isAudio) SetPlaybackOperationBuffering(true);
+        try
+        {
+            await RunBackendOperationAsync(static backend => backend.PlayAsync());
+        }
+        catch
+        {
+            if (isAudio) SetPlaybackOperationBuffering(false);
+            throw;
+        }
+        if (isAudio) SetPlaybackOperationBuffering(false);
+    }
+    /// <summary>暂停播放并保留当前位置；不会阻塞 Avalonia UI 线程。<para>Pauses playback and keeps the current position without blocking the Avalonia UI thread.</para></summary>
+    public Task PauseAsync()
+    {
+        StopBufferingMonitor();
+        CancelSeekBuffering();
+        return RunBackendOperationAsync(static backend => backend.PauseAsync());
+    }
+    /// <summary>停止播放；不会阻塞 Avalonia UI 线程。<para>Stops playback without blocking the Avalonia UI thread.</para></summary>
+    public Task StopAsync()
+    {
+        StopBufferingMonitor();
+        CancelSeekBuffering();
+        return RunBackendOperationAsync(static backend => backend.StopAsync());
+    }
+
+    private Task RunBackendOperationAsync(Func<IMediaBackend, Task> operation)
+    {
+        if (_backend.RequiresUiThreadOpen)
+        {
+            // MFPlay requires its HWND/COM calls on the Avalonia native thread,
+            // but posting the operation makes the public API non-blocking for
+            // button clicks, bindings, and AudioPlayer playback.
+            var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            Dispatcher.UIThread.Post(async () =>
+            {
+                try
+                {
+                    await operation(_backend);
+                    completion.TrySetResult();
+                }
+                catch (Exception ex)
+                {
+                    completion.TrySetException(ex);
+                }
+            }, DispatcherPriority.Background);
+            return completion.Task;
+        }
+
+        return _backendWorker?.InvokeAsync(() => operation(_backend))
+            ?? Task.Run(() => operation(_backend));
+    }
+
+    private Task RunBackendActionAsync(Action<IMediaBackend> action)
+    {
+        if (_backend.RequiresUiThreadOpen)
+        {
+            Dispatcher.UIThread.Post(() =>
+            {
+                try { action(_backend); }
+                catch (Exception ex) { OnUi(() => Error?.Invoke(this, new MediaErrorEventArgs(ex.Message, ex))); }
+            }, DispatcherPriority.Background);
+            return Task.CompletedTask;
+        }
+        return _backendWorker?.InvokeAsync(() => action(_backend))
+            ?? Task.Run(() => action(_backend));
+    }
     /// <summary>跳转到指定播放位置。<para>Seeks to the specified playback position.</para></summary>
     /// <param name="position">目标位置；超出有效范围时由后端进行限制。<para>Target position; the backend clamps values outside the valid range.</para></param>
-    public void Seek(TimeSpan position) => _backend.Seek(position);
+    public void Seek(TimeSpan position)
+    {
+        var pending = BeginSeekBuffering(position);
+        _ = RunSeekAsync(position, pending);
+        _ = FinishSeekBufferingAsync(pending.Generation, pending.Waiter, pending.StartedTimestamp);
+    }
+
+    private async Task RunSeekAsync(TimeSpan position, SeekBufferingRequest pending)
+    {
+        try
+        {
+            await RunBackendActionAsync(backend => backend.Seek(position));
+        }
+        catch (Exception ex)
+        {
+            EndSeekBuffering(pending.Generation, pending.Waiter);
+            OnUi(() => Error?.Invoke(this, new MediaErrorEventArgs(ex.Message, ex)));
+        }
+    }
     /// <summary>在播放和暂停之间切换。<para>Toggles between playing and paused states.</para></summary>
     public Task TogglePlayPause() => IsPlaying ? PauseAsync() : PlayAsync();
     /// <summary>向前跳转，默认 10 秒。<para>Seeks forward by 10 seconds by default.</para></summary>
@@ -265,6 +458,294 @@ public abstract class MediaPlayer : TemplatedControl, IAsyncDisposable, IDisposa
     /// <summary>向后跳转，默认 10 秒。<para>Seeks backward by 10 seconds by default.</para></summary>
     /// <param name="amount">跳转时长；省略时为 10 秒。<para>Seek amount; defaults to 10 seconds.</para></param>
     public void SeekBackward(TimeSpan? amount = null) => Seek(Position - (amount ?? TimeSpan.FromSeconds(10)));
+
+    private SeekBufferingRequest BeginSeekBuffering(TimeSpan target)
+    {
+        var waiter = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource? previous;
+        bool oldValue;
+        int generation;
+        long started;
+        lock (_seekBufferGate)
+        {
+            previous = _seekReady;
+            oldValue = IsBuffering;
+            generation = ++_seekGeneration;
+            started = Stopwatch.GetTimestamp();
+            _seekTarget = target < TimeSpan.Zero ? TimeSpan.Zero : target;
+            _seekOrigin = _position;
+            _seekOriginFrameContentHash = _lastVideoFrameContentHash;
+            _seekReady = waiter;
+            _seekStartedTimestamp = started;
+            _seekBuffering = true;
+        }
+        previous?.TrySetCanceled();
+        if (!oldValue) OnUi(() => RaisePropertyChanged(IsBufferingProperty, false, true));
+        return new SeekBufferingRequest(generation, waiter, started);
+    }
+
+    private void MarkSeekReady(TimeSpan? framePosition = null, long capturedTimestamp = 0, ulong contentHash = 0)
+    {
+        TaskCompletionSource? waiter;
+        long started;
+        lock (_seekBufferGate)
+        {
+            if (!_seekBuffering) return;
+            waiter = _seekReady;
+            started = _seekStartedTimestamp;
+        }
+        if (waiter is null) return;
+        if (framePosition is not null)
+        {
+            // Video seeking is considered ready only after a frame published
+            // after the seek request reaches the UI and is close to the target
+            // timestamp. A pre-seek frame or a stale position tick cannot hide
+            // the indicator anymore.
+            if (capturedTimestamp < started) return;
+            var target = _seekTarget;
+            var origin = _seekOrigin;
+            var frame = framePosition.Value;
+            var nearTarget = target >= origin
+                ? frame >= target - TimeSpan.FromMilliseconds(350)
+                : frame <= target + TimeSpan.FromMilliseconds(350);
+            if (!nearTarget) return;
+            if (_seekOriginFrameContentHash != 0
+                && contentHash != 0
+                && contentHash == _seekOriginFrameContentHash)
+                return;
+        }
+        var elapsed = Stopwatch.GetElapsedTime(started);
+        if (elapsed >= TimeSpan.FromMilliseconds(SeekIndicatorMinimumMilliseconds))
+            waiter.TrySetResult();
+    }
+
+    private async Task FinishSeekBufferingAsync(int generation, TaskCompletionSource waiter, long started)
+    {
+        try
+        {
+            await WaitForSeekReadinessAsync(
+                waiter.Task,
+                this is VideoPlayer,
+                TimeSpan.FromMilliseconds(SeekIndicatorTimeoutMilliseconds));
+        }
+        catch (TimeoutException)
+        {
+            // Audio has no rendered frame with which to confirm readiness, so
+            // its indicator uses the timeout as a final fallback.
+        }
+        catch (OperationCanceledException) { return; }
+
+        var remaining = TimeSpan.FromMilliseconds(SeekIndicatorMinimumMilliseconds) - Stopwatch.GetElapsedTime(started);
+        if (remaining > TimeSpan.Zero)
+        {
+            try { await Task.Delay(remaining); }
+            catch (OperationCanceledException) { return; }
+        }
+        EndSeekBuffering(generation, waiter);
+    }
+
+    internal static async Task WaitForSeekReadinessAsync(
+        Task ready,
+        bool requireRenderedVideoFrame,
+        TimeSpan timeout)
+    {
+        try
+        {
+            await ready.WaitAsync(timeout);
+        }
+        catch (TimeoutException) when (requireRenderedVideoFrame)
+        {
+            // WaitAsync does not cancel the underlying task. Keep observing it:
+            // otherwise a frame arriving after the timeout can signal readiness
+            // but nobody remains to clear the seek indicator.
+            await ready;
+        }
+    }
+
+    private void EndSeekBuffering(int generation, TaskCompletionSource waiter)
+    {
+        bool changed;
+        lock (_seekBufferGate)
+        {
+            if (generation != _seekGeneration || !ReferenceEquals(waiter, _seekReady)) return;
+            changed = _seekBuffering;
+            _seekBuffering = false;
+            _seekReady = null;
+        }
+        if (changed && _state != MediaState.Loading)
+            OnUi(() => RaisePropertyChanged(IsBufferingProperty, true, IsBuffering));
+    }
+
+    private void CancelSeekBuffering()
+    {
+        TaskCompletionSource? waiter;
+        bool changed;
+        lock (_seekBufferGate)
+        {
+            ++_seekGeneration;
+            waiter = _seekReady;
+            _seekReady = null;
+            changed = _seekBuffering;
+            _seekBuffering = false;
+        }
+        waiter?.TrySetCanceled();
+        if (changed && _state != MediaState.Loading)
+            OnUi(() => RaisePropertyChanged(IsBufferingProperty, true, IsBuffering));
+    }
+
+    private readonly record struct SeekBufferingRequest(int Generation, TaskCompletionSource Waiter, long StartedTimestamp);
+
+    private void BeginFirstVideoFrameWaitIfNeeded()
+    {
+        if (this is not VideoPlayer) return;
+
+        bool changed;
+        lock (_seekBufferGate)
+        {
+            changed = !_awaitingFirstVideoFrame;
+            if (changed)
+            {
+                _awaitingFirstVideoFrame = true;
+                _firstVideoFrameWaitStartedTimestamp = Stopwatch.GetTimestamp();
+                _lastRenderedFrameTimestamp = 0;
+                _lastRenderedProgressPosition = null;
+                _lastRenderedProgressContentHash = 0;
+            }
+        }
+        if (changed) OnUi(() => RaisePropertyChanged(IsBufferingProperty, false, IsBuffering));
+        StartBufferingMonitor();
+    }
+
+    private void BeginNetworkPlaybackWait()
+    {
+        var old = IsBuffering;
+        _lastPlaybackProgressTimestamp = Stopwatch.GetTimestamp();
+        _lastObservedAudioPosition = _position;
+        _networkBuffering = MediaSource.IsStreaming(Source);
+        if (old != IsBuffering)
+            OnUi(() => RaisePropertyChanged(IsBufferingProperty, old, IsBuffering));
+    }
+
+    private void SetPlaybackOperationBuffering(bool value)
+    {
+        var old = IsBuffering;
+        _playbackOperationBuffering = value;
+        if (old != IsBuffering)
+            OnUi(() => RaisePropertyChanged(IsBufferingProperty, old, IsBuffering));
+    }
+
+    private void StartBufferingMonitor()
+    {
+        OnUi(() =>
+        {
+            if (_bufferingMonitor is not null) return;
+            _bufferingMonitor = new DispatcherTimer(
+                TimeSpan.FromMilliseconds(200),
+                DispatcherPriority.Background,
+                (_, _) => UpdateBufferingFromRenderedFrame());
+            _bufferingMonitor.Start();
+        });
+    }
+
+    private void StopBufferingMonitor()
+    {
+        OnUi(() =>
+        {
+            _bufferingMonitor?.Stop();
+            _bufferingMonitor = null;
+            var old = IsBuffering;
+            _networkBuffering = false;
+            _awaitingFirstVideoFrame = false;
+            _playbackOperationBuffering = false;
+            if (old != IsBuffering)
+            {
+                RaisePropertyChanged(IsBufferingProperty, old, IsBuffering);
+            }
+        });
+    }
+
+    private void UpdateBufferingFromRenderedFrame()
+    {
+        if (_disposed || !_isPlaying) return;
+
+        var hasRenderedFrame = _lastRenderedFrameTimestamp != 0;
+        if (this is VideoPlayer && _awaitingFirstVideoFrame && hasRenderedFrame)
+        {
+            var old = IsBuffering;
+            _awaitingFirstVideoFrame = false;
+            if (old != IsBuffering)
+                RaisePropertyChanged(IsBufferingProperty, old, IsBuffering);
+        }
+
+        if (!MediaSource.IsStreaming(Source)) return;
+        var progressTimestamp = this is VideoPlayer
+            ? _lastRenderedFrameTimestamp
+            : _lastPlaybackProgressTimestamp;
+        var elapsed = progressTimestamp == 0
+            ? TimeSpan.MaxValue
+            : Stopwatch.GetElapsedTime(progressTimestamp);
+        var stalled = elapsed >= TimeSpan.FromMilliseconds(NetworkBufferingThresholdMilliseconds);
+        if (stalled == _networkBuffering) return;
+        var wasBuffering = IsBuffering;
+        _networkBuffering = stalled;
+        if (wasBuffering != IsBuffering)
+            RaisePropertyChanged(IsBufferingProperty, wasBuffering, IsBuffering);
+    }
+
+    private void VideoFrameSurfaceRendered(object? sender, EventArgs e)
+    {
+        if (!_videoFrameNeedsRender) return;
+        _videoFrameNeedsRender = false;
+        if (_lastVideoFrameCapturedTimestamp < _firstVideoFrameWaitStartedTimestamp) return;
+
+        // Count only a genuinely advancing frame as playback progress. Windows
+        // capture can keep returning the same old bitmap while an online source
+        // is buffering; treating every capture callback as progress made the
+        // spinner disappear even though the picture was still frozen.
+        if (HasMeaningfulVideoFrameProgress(
+                _lastRenderedFrameTimestamp,
+                _lastRenderedProgressPosition,
+                _lastRenderedProgressContentHash,
+                _lastVideoFramePosition,
+                _lastVideoFrameContentHash))
+        {
+            _lastRenderedFrameTimestamp = Stopwatch.GetTimestamp();
+            _lastPlaybackProgressTimestamp = _lastRenderedFrameTimestamp;
+            _lastRenderedProgressPosition = _lastVideoFramePosition;
+            _lastRenderedProgressContentHash = _lastVideoFrameContentHash;
+        }
+        // Render may record progress, but must never change a bound property:
+        // the loading overlay's visibility invalidates layout during the pass.
+        // Capture this frame's identity so a queued notification cannot certify
+        // a newer frame (or a replacement Source) which has not rendered yet.
+        var generation = _openGeneration;
+        var position = _lastVideoFramePosition;
+        var capturedTimestamp = _lastVideoFrameCapturedTimestamp;
+        var contentHash = _lastVideoFrameContentHash;
+        Dispatcher.UIThread.Post(() =>
+        {
+            if (_disposed || generation != _openGeneration) return;
+            MarkSeekReady(position, capturedTimestamp, contentHash);
+            UpdateBufferingFromRenderedFrame();
+        }, DispatcherPriority.Background);
+    }
+
+    internal static bool HasMeaningfulVideoFrameProgress(
+        long lastProgressTimestamp,
+        TimeSpan? previousPosition,
+        ulong previousContentHash,
+        TimeSpan? currentPosition,
+        ulong currentContentHash)
+    {
+        if (lastProgressTimestamp == 0) return true;
+        if (currentPosition is { } position
+            && (previousPosition is null
+                || position > previousPosition.Value + TimeSpan.FromMilliseconds(15)
+                || position < previousPosition.Value - TimeSpan.FromMilliseconds(100)))
+            return true;
+        return currentContentHash != 0 && currentContentHash != previousContentHash;
+    }
+
     protected override void OnApplyTemplate(TemplateAppliedEventArgs e)
     {
         UnhookTemplateParts();
@@ -277,6 +758,8 @@ public abstract class MediaPlayer : TemplatedControl, IAsyncDisposable, IDisposa
         _seekSlider = e.NameScope.Find<Slider>("PART_SeekSlider");
         _volumeSlider = e.NameScope.Find<Slider>("PART_VolumeSlider");
         _videoSurface = e.NameScope.Find<NativeMediaSurface>("PART_VideoSurface");
+        _videoFrameSurface = e.NameScope.Find<VideoFrameSurface>("PART_VideoFrameSurface");
+        if (_videoFrameSurface is not null) _videoFrameSurface.FrameRendered += VideoFrameSurfaceRendered;
         _controlOverlay = e.NameScope.Find<Control>("PART_ControlOverlay");
         if (_videoSurface is not null) _videoSurface.Backend = _backend;
         if (_videoSurface is not null)
@@ -289,7 +772,11 @@ public abstract class MediaPlayer : TemplatedControl, IAsyncDisposable, IDisposa
         if (_stopButton is not null) _stopButton.Click += StopClick;
         if (_muteButton is not null) _muteButton.Click += MuteClick;
         if (_fullScreenButton is not null) _fullScreenButton.Click += FullScreenClick;
-        if (_seekSlider is not null) _seekSlider.AddHandler(PointerReleasedEvent, SeekReleased, RoutingStrategies.Tunnel);
+        if (_seekSlider is not null)
+        {
+            _seekSlider.AddHandler(PointerPressedEvent, SeekPressed, RoutingStrategies.Tunnel);
+            _seekSlider.AddHandler(PointerReleasedEvent, SeekReleased, RoutingStrategies.Tunnel);
+        }
         if (_volumeSlider is not null) _volumeSlider.ValueChanged += VolumeSliderChanged;
         AddHandler(PointerMovedEvent, PlayerPointerMoved, RoutingStrategies.Bubble);
         AddHandler(PointerEnteredEvent, PlayerPointerEntered, RoutingStrategies.Bubble);
@@ -305,6 +792,15 @@ public abstract class MediaPlayer : TemplatedControl, IAsyncDisposable, IDisposa
     private void StopClick(object? s, global::Avalonia.Interactivity.RoutedEventArgs e) => _ = StopAsync();
     private void MuteClick(object? s, global::Avalonia.Interactivity.RoutedEventArgs e) => Muted = !Muted;
     private void FullScreenClick(object? s, global::Avalonia.Interactivity.RoutedEventArgs e) => ToggleFullscreen();
+    private void SeekPressed(object? s, PointerPressedEventArgs e)
+    {
+        if (_seekSlider is null || _seekSlider.Bounds.Width <= 0) return;
+        var point = e.GetPosition(_seekSlider);
+        var ratio = Math.Clamp(point.X / _seekSlider.Bounds.Width, 0, 1);
+        var value = _seekSlider.Minimum + (_seekSlider.Maximum - _seekSlider.Minimum) * ratio;
+        _seekSlider.Value = value;
+        e.Handled = true;
+    }
     private void SeekReleased(object? s, PointerReleasedEventArgs e) { if (_seekSlider is not null) Seek(TimeSpan.FromSeconds(_seekSlider.Value)); }
     private void VolumeSliderChanged(object? sender, RangeBaseValueChangedEventArgs e)
     {
@@ -313,11 +809,34 @@ public abstract class MediaPlayer : TemplatedControl, IAsyncDisposable, IDisposa
         if (e.NewValue <= 0.0001) Muted = true;
         else if (Muted) Muted = false;
     }
+
+    // SVG-compatible path data keeps every default button icon vector-based
+    // and independent from emoji/font availability on the host platform.
+    private const string SvgPlay = "M 5 3 L 19 12 L 5 21 Z";
+    private const string SvgPause = "M 4 3 H 9 V 21 H 4 Z M 15 3 H 20 V 21 H 15 Z";
+    private const string SvgStop = "M 5 5 H 19 V 19 H 5 Z";
+    private const string SvgVolume = "M 3 9 H 7 L 12 4 V 20 L 7 15 H 3 Z M 15 9 H 17 V 15 H 15 Z M 19 6 H 21 V 18 H 19 Z";
+    private const string SvgMute = "M 3 9 H 7 L 12 4 V 20 L 7 15 H 3 Z M 14 9 L 20 15 L 18 17 L 12 11 Z M 20 9 L 14 15 L 12 13 L 18 7 Z";
+    private const string SvgFullscreen = "M 3 3 H 10 V 5 H 5 V 10 H 3 Z M 14 3 H 21 V 10 H 19 V 5 H 14 Z M 3 14 H 5 V 19 H 10 V 21 H 3 Z M 19 14 H 21 V 21 H 14 V 19 H 19 Z";
+
+    private static SvgPath CreateSvgIcon(string pathData, double size)
+        => new()
+        {
+            Data = StreamGeometry.Parse(pathData),
+            Fill = Brushes.White,
+            Width = size,
+            Height = size,
+            Stretch = Stretch.Uniform,
+            HorizontalAlignment = global::Avalonia.Layout.HorizontalAlignment.Center,
+            VerticalAlignment = global::Avalonia.Layout.VerticalAlignment.Center,
+            IsHitTestVisible = false
+        };
+
     private void UpdateTemplateParts()
     {
-        if (_playButton is not null) _playButton.Content = IsPlaying ? "❚❚" : "▶";
+        if (_playButton is not null) _playButton.Content = CreateSvgIcon(IsPlaying ? SvgPause : SvgPlay, 18);
         if (_centerPlayButton is not null) _centerPlayButton.IsVisible = CenterPlayVisible;
-        if (_muteButton is not null) _muteButton.Content = Muted || Volume <= 0 ? "🔇" : "🔊";
+        if (_muteButton is not null) _muteButton.Content = CreateSvgIcon(Muted || Volume <= 0 ? SvgMute : SvgVolume, 18);
         if (_volumeSlider is not null)
         {
             _updating = true;
@@ -340,19 +859,25 @@ public abstract class MediaPlayer : TemplatedControl, IAsyncDisposable, IDisposa
             _videoSurface.Backend = null;
         }
         _videoSurface = null;
+        if (_videoFrameSurface is not null) _videoFrameSurface.FrameRendered -= VideoFrameSurfaceRendered;
+        _videoFrameSurface = null;
         _controlOverlay = null;
         if (_playButton is not null) _playButton.Click -= PlayClick;
         if (_centerPlayButton is not null) _centerPlayButton.Click -= PlayClick;
         if (_stopButton is not null) _stopButton.Click -= StopClick;
         if (_muteButton is not null) _muteButton.Click -= MuteClick;
         if (_fullScreenButton is not null) _fullScreenButton.Click -= FullScreenClick;
-        if (_seekSlider is not null) _seekSlider.RemoveHandler(PointerReleasedEvent, SeekReleased);
+        if (_seekSlider is not null)
+        {
+            _seekSlider.RemoveHandler(PointerPressedEvent, SeekPressed);
+            _seekSlider.RemoveHandler(PointerReleasedEvent, SeekReleased);
+        }
         if (_volumeSlider is not null) _volumeSlider.ValueChanged -= VolumeSliderChanged;
         _volumeSlider = null;
     }
     private void SetPosition(TimeSpan value)
     {
-        if (!_updating && Math.Abs((value - _position).TotalMilliseconds) > 500) _backend.Seek(value);
+        if (!_updating && Math.Abs((value - _position).TotalMilliseconds) > 500) Seek(value);
     }
     private void SetIsPlaying(bool value) { if (!_updating && value != _isPlaying) _ = (value ? PlayAsync() : PauseAsync()); }
     private void PlayerPointerMoved(object? sender, PointerEventArgs e) { SetControlsVisible(true); _controlsTimer?.Stop(); _controlsTimer?.Start(); }
@@ -387,11 +912,13 @@ public abstract class MediaPlayer : TemplatedControl, IAsyncDisposable, IDisposa
     {
         b.Opened += (_, e) => OnUi(() => { SetState(MediaState.Ready); ClearRuntimeStatus(); Opened?.Invoke(this, e); });
         b.Playing += (_, e) => OnUi(() => { SetPlaying(true); SetState(MediaState.Playing); Playing?.Invoke(this, e); });
-        b.Paused += (_, e) => OnUi(() => { SetPlaying(false); SetControlsVisible(true); SetState(MediaState.Paused); Paused?.Invoke(this, e); });
-        b.Stopped += (_, e) => OnUi(() => { SetPlaying(false); SetControlsVisible(true); SetState(MediaState.Stopped); Stopped?.Invoke(this, e); });
-        b.Ended += (_, e) => OnUi(async () => { SetPlaying(false); SetControlsVisible(true); SetState(MediaState.Ended); Ended?.Invoke(this, e); if (Loop) { Seek(TimeSpan.Zero); await PlayAsync(); } });
-        b.PositionChanged += (_, e) => OnUi(() =>
+        b.Paused += (_, e) => OnUi(() => { StopBufferingMonitor(); SetPlaying(false); SetControlsVisible(true); SetState(MediaState.Paused); Paused?.Invoke(this, e); });
+        b.Stopped += (_, e) => OnUi(() => { StopBufferingMonitor(); SetPlaying(false); SetControlsVisible(true); SetState(MediaState.Stopped); Stopped?.Invoke(this, e); });
+        b.Ended += (_, e) => OnUi(async () => { StopBufferingMonitor(); SetPlaying(false); SetControlsVisible(true); SetState(MediaState.Ended); Ended?.Invoke(this, e); if (Loop) { Seek(TimeSpan.Zero); await PlayAsync(); } });
+        b.PositionChanged += (_, e) =>
         {
+            OnUi(() =>
+            {
             var old = _position;
             _position = e.Position;
             RaisePropertyChanged(PositionProperty, old, _position);
@@ -413,18 +940,81 @@ public abstract class MediaPlayer : TemplatedControl, IAsyncDisposable, IDisposa
             RaisePropertyChanged(BufferedPositionSecondsProperty, oldBuffered.TotalSeconds, _buffered.TotalSeconds);
             UpdateTemplateParts();
             PositionChanged?.Invoke(this, e);
-        });
+            if (this is AudioPlayer && _isPlaying
+                && e.Position > _lastObservedAudioPosition + TimeSpan.FromMilliseconds(15))
+            {
+                _lastPlaybackProgressTimestamp = Stopwatch.GetTimestamp();
+                if (_networkBuffering)
+                {
+                    var wasBuffering = IsBuffering;
+                    _networkBuffering = false;
+                    RaisePropertyChanged(IsBufferingProperty, wasBuffering, IsBuffering);
+                }
+            }
+            _lastObservedAudioPosition = e.Position;
+            if (this is not VideoPlayer) MarkSeekReady();
+            });
+        };
         b.VolumeChanged += (_, e) => OnUi(() => { _updating = true; try { SetCurrentValue(VolumeProperty, e.Volume); } finally { _updating = false; } UpdateTemplateParts(); VolumeChanged?.Invoke(this, e); });
-        b.VideoFrameAvailable += (_, e) => OnUi(() => { var old = _videoFrame; _videoFrame = e.Frame; RaisePropertyChanged(VideoFrameProperty, old, _videoFrame); old?.Dispose(); });
+        b.VideoFrameAvailable += (_, e) =>
+        {
+            lock (_pendingFrameGate)
+            {
+                if (_disposed) { e.Frame.Dispose(); return; }
+                _pendingVideoFrame?.Frame.Dispose();
+                _pendingVideoFrame = e;
+                if (_frameDeliveryScheduled) return;
+                _frameDeliveryScheduled = true;
+            }
+            // Keep only the newest pending frame if the display cannot keep up.
+            // Never enqueue an unbounded number of full-resolution bitmaps.
+            Dispatcher.UIThread.Post(DeliverVideoFrame, DispatcherPriority.Background);
+        };
         b.RuntimeStatusChanged += (_, e) => OnUi(() => { var old = _runtimeStatus; _runtimeStatus = e.Message; RaisePropertyChanged(RuntimeStatusProperty, old, _runtimeStatus); RaisePropertyChanged(RuntimeStatusVisibleProperty, !string.IsNullOrWhiteSpace(old), RuntimeStatusVisible); });
-        b.Error += (_, e) => OnUi(() => { SetState(MediaState.Error); var old = _runtimeStatus; _runtimeStatus = e.Message; RaisePropertyChanged(RuntimeStatusProperty, old, _runtimeStatus); RaisePropertyChanged(RuntimeStatusVisibleProperty, !string.IsNullOrWhiteSpace(old), RuntimeStatusVisible); Error?.Invoke(this, e); });
+        b.Error += (_, e) => OnUi(() => { StopBufferingMonitor(); CancelSeekBuffering(); SetState(MediaState.Error); var old = _runtimeStatus; _runtimeStatus = e.Message; RaisePropertyChanged(RuntimeStatusProperty, old, _runtimeStatus); RaisePropertyChanged(RuntimeStatusVisibleProperty, !string.IsNullOrWhiteSpace(old), RuntimeStatusVisible); Error?.Invoke(this, e); });
     }
-    private void SetPlaying(bool value) { _updating = true; try { var old = _isPlaying; _isPlaying = value; RaisePropertyChanged(IsPlayingProperty, old, value); RaisePropertyChanged(CenterPlayVisibleProperty, !old, CenterPlayVisible); UpdateTemplateParts(); } finally { _updating = false; } }
+    private void DeliverVideoFrame()
+    {
+        VideoFrameEventArgs? frame;
+        lock (_pendingFrameGate)
+        {
+            frame = _pendingVideoFrame;
+            _pendingVideoFrame = null;
+            _frameDeliveryScheduled = false;
+        }
+        if (frame is null) return;
+        if (_disposed) { frame.Frame.Dispose(); return; }
+        var old = _videoFrame;
+        _videoFrame = frame.Frame;
+        _lastVideoFramePosition = frame.Position;
+        _lastVideoFrameCapturedTimestamp = frame.CapturedTimestamp;
+        _lastVideoFrameContentHash = frame.ContentHash;
+        _videoFrameNeedsRender = true;
+        RaisePropertyChanged(VideoFrameProperty, old, _videoFrame);
+        old?.Dispose();
+    }
+
+    private void SetPlaying(bool value) { _updating = true; try { var old = _isPlaying; _isPlaying = value; RaisePropertyChanged(IsPlayingProperty, old, value); RaisePropertyChanged(CenterPlayVisibleProperty, !old, CenterPlayVisible); UpdateTemplateParts(); if (value) ScheduleVideoFrameClock(); } finally { _updating = false; } }
+
+    private void ScheduleVideoFrameClock()
+    {
+        if (_disposed || !IsPlaying || _frameClockScheduled || _frameClockHost is null) return;
+        _frameClockScheduled = true;
+        _frameClockHost.RequestAnimationFrame(_ =>
+        {
+            _frameClockScheduled = false;
+            if (_disposed || !IsPlaying || _frameClockHost is null) return;
+            if (_backend is IVideoFrameClockBackend clock) clock.RequestVideoFrame();
+            ScheduleVideoFrameClock();
+        });
+    }
     private void SetState(MediaState value)
     {
         var oldState = _state;
+        var wasBuffering = IsBuffering;
         _state = value;
         RaisePropertyChanged(StateProperty, oldState, value);
+        RaisePropertyChanged(IsBufferingProperty, wasBuffering, IsBuffering);
         var oldDuration = _duration;
         _duration = _backend.Duration;
         RaisePropertyChanged(DurationProperty, oldDuration, _duration);
@@ -450,6 +1040,12 @@ public abstract class MediaPlayer : TemplatedControl, IAsyncDisposable, IDisposa
     protected override void OnAttachedToVisualTree(global::Avalonia.VisualTreeAttachmentEventArgs e)
     {
         base.OnAttachedToVisualTree(e);
+        if (this is VideoPlayer && _backend is IVideoFrameClockBackend clock)
+        {
+            _frameClockHost = TopLevel.GetTopLevel(this);
+            clock.SetExternalFrameClock(_frameClockHost is not null);
+            ScheduleVideoFrameClock();
+        }
         // OnDetachedFromVisualTree normally runs during window shutdown, but
         // some desktop lifetime/platform combinations close the native window
         // before Avalonia detaches every child.  Observe Closed as a second,
@@ -475,7 +1071,109 @@ public abstract class MediaPlayer : TemplatedControl, IAsyncDisposable, IDisposa
         Dispose();
     }
     /// <summary>异步释放播放器及其后端资源。<para>Asynchronously releases the player and backend resources.</para></summary>
-    public async ValueTask DisposeAsync() { Dispose(); await _backend.DisposeAsync(); }
+    public ValueTask DisposeAsync() { Dispose(); return ValueTask.CompletedTask; }
     /// <summary>同步释放播放器及其后端资源。<para>Synchronously releases the player and backend resources.</para></summary>
-    public void Dispose() { if (_disposed) return; _disposed = true; UnhookTemplateParts(); _backend.Dispose(); }
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        _frameClockHost = null;
+        lock (_pendingFrameGate)
+        {
+            _pendingVideoFrame?.Frame.Dispose();
+            _pendingVideoFrame = null;
+        }
+        CancelSeekBuffering();
+        StopBufferingMonitor();
+        UnhookTemplateParts();
+        if (_backendWorker is not null) _backendWorker.DisposeBackend(_backend);
+        else _backend.Dispose();
+    }
+
+    private sealed class BackendWorker : IDisposable
+    {
+        private readonly BlockingCollection<Action> _queue = new();
+        private readonly Thread _thread;
+        private int _disposed;
+
+        public BackendWorker(string name)
+        {
+            _thread = new Thread(Run)
+            {
+                IsBackground = true,
+                Name = name
+            };
+            if (OperatingSystem.IsWindows()) _thread.SetApartmentState(ApartmentState.MTA);
+            _thread.Start();
+        }
+
+        public Task InvokeAsync(Func<Task> operation)
+            => Enqueue(() => operation().GetAwaiter().GetResult());
+
+        public Task InvokeAsync(Action operation)
+            => Enqueue(operation);
+
+        private Task Enqueue(Action operation)
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+                return Task.FromException(new ObjectDisposedException(nameof(BackendWorker)));
+
+            var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            try
+            {
+                _queue.Add(() =>
+                {
+                    try
+                    {
+                        operation();
+                        completion.TrySetResult();
+                    }
+                    catch (Exception ex)
+                    {
+                        completion.TrySetException(ex);
+                    }
+                });
+            }
+            catch (InvalidOperationException)
+            {
+                completion.TrySetException(new ObjectDisposedException(nameof(BackendWorker)));
+            }
+            return completion.Task;
+        }
+
+        public void DisposeBackend(IMediaBackend backend)
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            var completion = new ManualResetEventSlim();
+            try
+            {
+                _queue.Add(() =>
+                {
+                    try { backend.Dispose(); }
+                    finally { completion.Set(); }
+                });
+                completion.Wait(TimeSpan.FromSeconds(5));
+            }
+            catch (InvalidOperationException) { }
+            finally
+            {
+                _queue.CompleteAdding();
+                if (Thread.CurrentThread != _thread) _thread.Join(1000);
+                completion.Dispose();
+            }
+        }
+
+        private void Run()
+        {
+            foreach (var operation in _queue.GetConsumingEnumerable()) operation();
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            _queue.CompleteAdding();
+            if (Thread.CurrentThread != _thread) _thread.Join(1000);
+            _queue.Dispose();
+        }
+    }
 }

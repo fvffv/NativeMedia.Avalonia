@@ -34,3 +34,10 @@ public interface IMediaBackend : IAsyncDisposable, IDisposable
     Task StopAsync(CancellationToken cancellationToken = default);
     void Seek(TimeSpan position);
 }
+
+/// <summary>Optional backend switch used to disable video-only work for AudioPlayer. <para>Optional backend switch for disabling video-only work when used by AudioPlayer.</para></summary>
+public interface IVideoMediaBackend
+{
+    /// <summary>Configures whether a video output is required. <para>Configures whether video output is required.</para></summary>
+    void ConfigureVideoOutput(bool enabled);
+}
