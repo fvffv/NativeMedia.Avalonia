@@ -11,8 +11,19 @@ namespace NativeMedia.Avalonia.Linux;
 /// frames are copied as BGRA into the normal Avalonia scene so overlays remain possible.
 /// Audio is sent by FFmpeg to the system ALSA/Pulse/PipeWire default device.
 /// </summary>
-public sealed class LinuxFfmpegBackend : NativeMediaBackend, IVideoMediaBackend, IVideoQualityMediaBackend
+public sealed class LinuxFfmpegBackend : NativeMediaBackend, IVideoMediaBackend, IVideoQualityMediaBackend, IGpuVideoBackend
 {
+    private VideoFrameSurface? _presentationSurface;
+    private MpvVideoSession? _gpu;
+    private string? _gpuFallback;
+    private int _openGeneration;
+    private bool _openingGpu;
+    public event EventHandler<GpuVideoFramePresentedEventArgs>? GpuFramePresented;
+    public VideoPlaybackStatistics PlaybackStatistics => _gpu?.Statistics
+        ?? new("FFmpeg / CPU bitmap", 0, 0, 0, 0, _gpuFallback);
+    public void SetPresentationSurface(VideoFrameSurface? surface) => _presentationSurface = surface;
+    protected override TimeSpan QueryPosition() => _gpu is { } gpu
+        ? TimeSpan.FromSeconds(gpu.Position) : base.QueryPosition();
     private VideoPlaybackQuality _playbackQuality = VideoPlaybackQuality.Original;
     private readonly object _processGate = new();
     private Process? _videoProcess;
@@ -29,7 +40,7 @@ public sealed class LinuxFfmpegBackend : NativeMediaBackend, IVideoMediaBackend,
     private bool _disposed;
 
     public LinuxFfmpegBackend() : base("Linux FFmpeg", CheckFfmpeg()) { }
-    public override bool IsAvailable => CheckFfmpeg();
+    public override bool IsAvailable => CheckFfmpeg() || (_videoOutputEnabled && MpvNative.IsAvailable);
     public void ConfigureVideoOutput(bool enabled) => _videoOutputEnabled = enabled;
     /// <inheritdoc />
     public Task SetPlaybackQualityAsync(VideoPlaybackQuality quality, CancellationToken cancellationToken = default)
@@ -40,6 +51,7 @@ public sealed class LinuxFfmpegBackend : NativeMediaBackend, IVideoMediaBackend,
         {
             if (_disposed || _playbackQuality == quality) return Task.CompletedTask;
             _playbackQuality = quality;
+            if (_gpu is { } gpu) { gpu.SetQuality(quality); return Task.CompletedTask; }
             if (_videoOutputEnabled && State == MediaState.Playing) return PlayAsync(cancellationToken);
         }
         return Task.CompletedTask;
@@ -53,7 +65,53 @@ public sealed class LinuxFfmpegBackend : NativeMediaBackend, IVideoMediaBackend,
     public override async Task OpenAsync(string source, CancellationToken cancellationToken = default)
     {
         if (!OperatingSystem.IsLinux()) { RaiseError("The FFmpeg backend is only available on Linux."); return; }
-        if (!IsAvailable)
+        if (!MediaSource.TryParse(source, out var uri, out _, out var error)) { RaiseError(error!); return; }
+        var generation = Interlocked.Increment(ref _openGeneration);
+        _gpu?.Dispose();
+        _gpu = null;
+        lock (_processGate) StopProcessesLocked();
+        _source = uri!.IsFile ? uri.LocalPath : source;
+        _headless = string.Equals(Environment.GetEnvironmentVariable("AVALONIA_NATIVE_MEDIA_HEADLESS"), "1", StringComparison.Ordinal);
+        _gpuFallback = null;
+        if (_videoOutputEnabled && !_headless && _presentationSurface is { } surface && MpvNative.IsAvailable
+            && Environment.GetEnvironmentVariable("AVALONIA_NATIVE_MEDIA_DISABLE_MPV") != "1")
+        {
+            MpvVideoSession? session = null;
+            try
+            {
+                _openingGpu = true;
+                session = new(surface);
+                _gpu = session;
+                session.SetQuality(_playbackQuality);
+                session.SetVolume(Volume);
+                session.SetMuted(Muted);
+                session.Presented += (_, frame) =>
+                {
+                    if (ReferenceEquals(_gpu, session) && !_disposed)
+                    {
+                        if (session.Duration > 0) Duration = TimeSpan.FromSeconds(session.Duration);
+                        GpuFramePresented?.Invoke(this, frame);
+                    }
+                };
+                session.Ended += () => { if (ReferenceEquals(_gpu, session) && !_disposed && State != MediaState.Ended) RaiseEndedFromBackend(); };
+                session.Failed += ex =>
+                {
+                    if (!_openingGpu && ReferenceEquals(_gpu, session) && !_disposed)
+                        _ = RecoverGpuAsync(session, generation, ex);
+                };
+                await session.OpenAsync(_source, cancellationToken);
+                if (_disposed || generation != _openGeneration) { session.Dispose(); return; }
+                await base.OpenAsync(source, cancellationToken);
+                if (session.Duration > 0) Duration = TimeSpan.FromSeconds(session.Duration);
+                RaiseRuntimeStatus("libmpv OpenGL presentation enabled. Hardware decoder selection is reported in PlaybackStatistics.");
+                return;
+            }
+            catch (OperationCanceledException) { session?.Dispose(); _gpu = null; throw; }
+            catch (Exception ex) { session?.Dispose(); _gpu = null; _gpuFallback = ex.Message; }
+            finally { _openingGpu = false; }
+        }
+        else if (_videoOutputEnabled) _gpuFallback = "libmpv unavailable/disabled, headless mode, or no Avalonia GPU surface.";
+        if (!CheckFfmpeg())
         {
             if (MediaRuntimeOptions.AutoInstallLinuxRuntime && !_installAttempted)
             {
@@ -65,9 +123,7 @@ public sealed class LinuxFfmpegBackend : NativeMediaBackend, IVideoMediaBackend,
             }
             RaiseError(CheckEnvironment().Error!); return;
         }
-        if (!MediaSource.TryParse(source, out var uri, out _, out var error)) { RaiseError(error!); return; }
-        _source = uri!.IsFile ? uri.LocalPath : source;
-        _headless = string.Equals(Environment.GetEnvironmentVariable("AVALONIA_NATIVE_MEDIA_HEADLESS"), "1", StringComparison.Ordinal);
+        if (_gpuFallback is not null) RaiseRuntimeStatus("Using FFmpeg CPU fallback: " + _gpuFallback);
         await base.OpenAsync(source, cancellationToken);
         var duration = await ProbeDurationAsync(_source, cancellationToken);
         if (duration > TimeSpan.Zero) Duration = duration;
@@ -75,6 +131,8 @@ public sealed class LinuxFfmpegBackend : NativeMediaBackend, IVideoMediaBackend,
 
     public override async Task PlayAsync(CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (_gpu is { } gpu) { gpu.Play(); await base.PlayAsync(cancellationToken); return; }
         Process? video = null;
         Process? audio = null;
         lock (_processGate)
@@ -144,12 +202,14 @@ public sealed class LinuxFfmpegBackend : NativeMediaBackend, IVideoMediaBackend,
 
     public override Task PauseAsync(CancellationToken cancellationToken = default)
     {
+        if (_gpu is { } gpu) { gpu.Pause(); return base.PauseAsync(cancellationToken); }
         lock (_processGate) StopProcessesLocked();
         return base.PauseAsync(cancellationToken);
     }
 
     public override Task StopAsync(CancellationToken cancellationToken = default)
     {
+        if (_gpu is { } gpu) { gpu.Stop(); return base.StopAsync(cancellationToken); }
         lock (_processGate) StopProcessesLocked();
         return base.StopAsync(cancellationToken);
     }
@@ -157,18 +217,41 @@ public sealed class LinuxFfmpegBackend : NativeMediaBackend, IVideoMediaBackend,
     public override void Seek(TimeSpan position)
     {
         base.Seek(position);
+        if (_gpu is { } gpu) { gpu.Seek(position); return; }
         if (State == MediaState.Playing && _source is not null) _ = PlayAsync();
     }
 
     public override double Volume
     {
         get => base.Volume;
-        set { base.Volume = value; if (State == MediaState.Playing && _source is not null) _ = Task.Run(RestartAudioAsync); }
+        set { base.Volume = value; if (_gpu is { } gpu) gpu.SetVolume(value); else if (State == MediaState.Playing && _source is not null) _ = Task.Run(RestartAudioAsync); }
     }
     public override bool Muted
     {
         get => base.Muted;
-        set { base.Muted = value; if (State == MediaState.Playing && _source is not null) _ = Task.Run(RestartAudioAsync); }
+        set { base.Muted = value; if (_gpu is { } gpu) gpu.SetMuted(value); else if (State == MediaState.Playing && _source is not null) _ = Task.Run(RestartAudioAsync); }
+    }
+
+    private async Task RecoverGpuAsync(MpvVideoSession session, int generation, Exception error)
+    {
+        // Serialize recovery on the UI dispatcher to avoid detaching a newer source.
+        await global::Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(async () =>
+        {
+            if (_disposed || generation != _openGeneration || !ReferenceEquals(_gpu, session)) return;
+            var position = TimeSpan.FromSeconds(session.Position);
+            var playing = State == MediaState.Playing;
+            _gpu = null;
+            session.Dispose();
+            _gpuFallback = error.Message;
+            if (!CheckFfmpeg()) { RaiseError("libmpv failed and FFmpeg fallback is unavailable: " + error.Message, error); return; }
+            RaiseRuntimeStatus("GPU playback failed; using FFmpeg CPU fallback: " + error.Message);
+            base.Seek(position);
+            if (playing)
+            {
+                try { await PlayAsync(); }
+                catch (Exception ex) { if (!_disposed) RaiseError("FFmpeg fallback failed: " + ex.Message, ex); }
+            }
+        });
     }
 
     private Task RestartAudioAsync()
@@ -487,6 +570,9 @@ public sealed class LinuxFfmpegBackend : NativeMediaBackend, IVideoMediaBackend,
     }
     public override void Dispose()
     {
+        Interlocked.Increment(ref _openGeneration);
+        _gpu?.Dispose();
+        _gpu = null;
         lock (_processGate)
         {
             if (_disposed) return;

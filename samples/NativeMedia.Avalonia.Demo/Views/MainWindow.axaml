@@ -3,16 +3,22 @@
     <Design.DataContext>
         <vm:MainViewModel />
     </Design.DataContext>
-    <ScrollViewer><StackPanel Margin="28" Spacing="18" MaxWidth="920" HorizontalAlignment="Center">
+    <ScrollViewer x:Name="DemoScroll" HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto"
+                  HorizontalContentAlignment="Stretch" VerticalContentAlignment="Stretch">
+    <Grid x:Name="DemoLayout" Margin="28" RowDefinitions="Auto,Auto,Auto" RowSpacing="18" MaxWidth="920" HorizontalAlignment="Stretch">
+    <StackPanel x:Name="DemoHeader" Grid.Row="0" Spacing="18">
       <TextBlock Text="Avalonia Native Media" FontSize="28" FontWeight="Bold" Foreground="#F5F7FA" />
-      <TextBlock Text="Media Foundation · FFmpeg · AVFoundation" Foreground="#8F9BAD" />
+      <TextBlock Text="Media Foundation · libmpv / FFmpeg · AVFoundation" Foreground="#8F9BAD" />
       <TextBlock Text="VideoPlayer" FontSize="18" FontWeight="SemiBold" Foreground="#DDE3EC" />
       <Button Content="Choose video file…" Click="ChooseVideo" Cursor="Hand" HorizontalAlignment="Left" />
       <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
         <TextBox x:Name="VideoUrlBox" PlaceholderText="Paste an HTTP/HTTPS video URL (HLS .m3u8 is supported by the system backend)" />
         <Button Grid.Column="1" Content="Play URL" Cursor="Hand" Click="PlayVideoUrl" />
       </Grid>
-      <media:VideoPlayer x:Name="VideoPlayer" Source="{Binding VideoSource}" AutoPlay="{Binding AutoPlay}" Position="{Binding VideoPosition, Mode=TwoWay}" Volume="{Binding VideoVolume, Mode=TwoWay}" IsPlaying="{Binding VideoIsPlaying, Mode=TwoWay}" Loop="{Binding Loop}" ShowControls="{Binding ShowControls}" Width="720" Height="400" />
+    </StackPanel>
+      <media:VideoPlayer x:Name="VideoPlayer" Grid.Row="1" Source="{Binding VideoSource}" AutoPlay="{Binding AutoPlay}" Position="{Binding VideoPosition, Mode=TwoWay}" Volume="{Binding VideoVolume, Mode=TwoWay}" IsPlaying="{Binding VideoIsPlaying, Mode=TwoWay}" Loop="{Binding Loop}" ShowControls="{Binding ShowControls}" Width="720" Height="400" HorizontalAlignment="Center" />
+    <StackPanel x:Name="DemoFooter" Grid.Row="2" Spacing="18">
+      <TextBlock x:Name="PlaybackDiagnostics" Foreground="#B9C5D5" TextWrapping="Wrap" />
       <TextBlock Text="AudioPlayer" FontSize="18" FontWeight="SemiBold" Foreground="#DDE3EC" />
       <Button Content="Choose audio file…" Click="ChooseAudio" Cursor="Hand" HorizontalAlignment="Left" />
       <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
@@ -28,6 +34,7 @@
         <Slider Grid.Column="4" Minimum="0" Maximum="1" Cursor="Hand" Value="{Binding VideoVolume}" />
       </Grid>
       <Border Background="#171D26" CornerRadius="8" Padding="12"><TextBlock Text="{Binding Status}" Foreground="#B9C5D5" TextWrapping="Wrap" /></Border>
-    </StackPanel></ScrollViewer>
+    </StackPanel>
+    </Grid></ScrollViewer>
 
 </Window>

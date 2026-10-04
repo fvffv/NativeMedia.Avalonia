@@ -10,7 +10,7 @@
 
     <!-- NuGet package metadata / NuGet 包元数据 -->
     <PackageId>NativeMedia.Avalonia</PackageId>
-    <Version>1.0.0</Version>
+    <Version>1.0.17</Version>
     <Authors>fvffv</Authors>
     <Title>NativeMedia.Avalonia</Title>
     <Description>A lightweight cross-platform native audio and video playback library for Avalonia 12. It uses the appropriate native media backend for each platform, including Windows Media Foundation, macOS AVFoundation, and Linux FFmpeg, while providing a unified, simple, MVVM-friendly, and NativeAOT-compatible playback API.</Description>

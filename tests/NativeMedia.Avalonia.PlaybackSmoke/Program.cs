@@ -15,7 +15,19 @@ internal static class Program
     public static int Main(string[] args)
     {
         Arguments = args;
+#if !PACKAGE_CONSUMER
         WindowsMediaFoundation.Use();
+#endif
+        using (var backend = MediaBackendFactory.Create())
+        {
+            Console.WriteLine($"Runtime={Environment.Version}; backend={backend.Name}; type={backend.GetType().FullName}");
+            if (OperatingSystem.IsWindows() && backend is not WindowsMediaFoundationBackend)
+            {
+                Console.Error.WriteLine("FAIL: the NuGet package did not register the Windows playback backend.");
+                return 2;
+            }
+        }
+        if (args.Contains("--registration-only")) return 0;
         return AppBuilder.Configure<SmokeApp>().UsePlatformDetect().StartWithClassicDesktopLifetime(args);
     }
 }
@@ -83,7 +95,7 @@ internal sealed class SmokeApp : Application
             await Task.Delay(100);
             peak = Math.Max(peak, ProcessAudioMeter.ReadPeak());
             advanced |= player.Position > TimeSpan.FromMilliseconds(250);
-            rendered |= video && player.VideoFrame is not null && !player.IsBuffering;
+            rendered |= video && (player.VideoFrame is not null || player.PlaybackStatistics?.CompositedFrames > 0) && !player.IsBuffering;
             if (i % 20 == 0) Console.WriteLine($"SAMPLE state={player.State}, position={player.Position.TotalSeconds:F3}, peak={peak:F6}, rendered={rendered}");
             if (error is not null) throw new InvalidOperationException(error);
             if (video && rendered && advanced && i > 40) break;
@@ -92,6 +104,12 @@ internal sealed class SmokeApp : Application
         if (!advanced) throw new InvalidOperationException("Native playback position never advanced.");
         if (!video && peak <= 0.00001f) throw new InvalidOperationException("No audio signal in this process's WASAPI session.");
         if (video && !rendered) throw new InvalidOperationException("No rendered video frame cleared buffering.");
+        if (video)
+        {
+            Console.WriteLine("PRESENTATION: " + player.PlaybackStatistics);
+            if (Program.Arguments.Contains("--require-gpu") && player.PlaybackStatistics?.CompositedFrames is not > 0)
+                throw new InvalidOperationException("GPU composition was required but the player fell back to CPU capture.");
+        }
         if (video)
         {
             player.Seek(TimeSpan.FromSeconds(5));

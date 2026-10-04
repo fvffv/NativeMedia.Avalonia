@@ -6,7 +6,11 @@
 
 A lightweight audio and video playback library for **Avalonia 12.1.1 / .NET 10**. It provides `VideoPlayer` and `AudioPlayer` controls backed by Windows Media Foundation, macOS AVFoundation, or Linux FFmpeg.
 
-This guide describes the source and API used by package **1.0.13**.
+This guide describes the source and API used by package **1.0.17**.
+
+Version 1.0.17 extends the Windows Media Engine/D3D11 path with optional Linux libmpv/OpenGL presentation and macOS AVFoundation/IOSurface import. All three paths remain in Avalonia's composition tree. Hardware decoding still depends on the codec, native player, GPU and driver. CPU fallback remains available.
+
+Version 1.0.14 fixes automatic backend registration for .NET 11 and platform-specific target frameworks such as `net10.0-windows` and `net11.0-windows`. The library still targets .NET 10; compatible newer applications do not need to register the backend manually. Earlier packages restricted registration to exactly `net10.0`, which could leave audio and video without native output.
 
 ### Features
 
@@ -23,7 +27,7 @@ This guide describes the source and API used by package **1.0.13**.
 Install the package from your configured NuGet sources:
 
 ```bash
-dotnet add package NativeMedia.Avalonia --version 1.0.13
+dotnet add package NativeMedia.Avalonia --version 1.0.17
 ```
 
 When using a locally built package, add this repository's `artifacts/packages` directory as a NuGet source first. The package contains the core library and all three platform adapters; it does not bundle FFmpeg or operating-system media frameworks.
@@ -118,7 +122,35 @@ For MVVM, bind `PlaybackQuality="{Binding SelectedPlaybackQuality}"` to a `Video
 
 `Original` is the original-quality/lossless-playback preset in the sense that it adds no resolution reduction or intentional frame-rate reduction. The current BGRA composition path does not promise bit-exact HDR/10-bit preservation. Actual display frame rate depends on decoding, copying, UI rendering, and display refresh rate. If rendering cannot keep up, the control retains only the newest pending frame instead of accumulating full-resolution images.
 
-Windows sizes the capture surface from native video dimensions; Windows and macOS request frames at the host's rendering cadence. Linux transfers uncompressed BMP frames with per-frame dimensions and applies no scaling or frame-selection filter in `Original` mode. Changing quality during Linux playback restarts FFmpeg at the current position and can briefly buffer.
+Windows uses native-sized D3D11 textures in `Original` mode and performs preset scaling on the GPU, using the compositor's DXGI adapter and a bounded three-texture pool. Windows and macOS request frames at the host's rendering cadence. Linux libmpv renders directly into an Avalonia OpenGL framebuffer, with preset resolution/frame-rate limits on presentation (not the source decoder). Its FFmpeg fallback transfers uncompressed BMP frames; `Original` adds no scaling or frame-selection filter. Changing quality on that fallback restarts FFmpeg at the current position and can briefly buffer. On macOS, a preset that requires downscaling uses CPU bitmap scaling; `Original` and sources already within the preset dimensions can use IOSurface import.
+
+### GPU playback and diagnostics
+
+Use the normal `VideoPlayer` template, attach it to a window, and keep `PlaybackQuality="Original"` for 4K/high-frame-rate sources. No extra video HWND is placed above Avalonia: overlays, controls, clipping and transforms stay in the Avalonia visual/composition tree. Windows 8+ Media Engine, a hardware D3D11 video device, and an Avalonia renderer supporting D3D11 shared textures/keyed mutexes are required for this path. Remote desktops, software renderers, unavailable GPU interop, or device failures can select CPU capture instead; `RuntimeStatus` and `PlaybackStatistics.FallbackReason` explain why.
+
+```csharp
+var stats = Player.PlaybackStatistics;
+// RenderingPath: "D3D11 shared texture / Media Engine" when the GPU path is active.
+// SubmittedFrames / CompositedFrames: source-session counters, not monitor scan-out FPS.
+// PresentationBusyCount: frame requests skipped while all textures are busy; NOT decoder drops.
+// LastTransferMilliseconds: CPU time submitting the last GPU transfer, not GPU execution time.
+```
+
+`PlaybackStatistics` is a C# snapshot getter (poll when needed), not a bindable live FPS property. `VideoFrame` stays null on the GPU path: CPU readback is deliberately omitted. GPU-to-GPU transfer/color conversion/composition still occurs; this is **no CPU readback**, not literally zero GPU copies. Output is currently BGRA8 SDR, not bit-exact 10-bit/HDR passthrough. A 120 Hz or faster display/compositor and hardware codec support are necessary to display 4K120; zero dropped frames cannot be promised on arbitrary hardware. This release has been compiled, but 4K120 playback and overlay performance require validation on the target machine.
+
+#### Linux: libmpv / OpenGL
+
+The default `LinuxFfmpegBackend` now first tries the system `libmpv.so.2` or `libmpv.so.1` for an attached video control. Install the **libmpv runtime** provided by your distribution, plus an appropriate GPU/VA-API/NVIDIA driver. Installing only the `mpv` executable is not sufficient if it does not provide the shared library. The library does not download or install libmpv. An Avalonia renderer capable of OpenGL composition/texture sharing is required; Intel VA-API interop generally requires EGL. X11/Wayland display connections are supplied to the render API and released with the renderer.
+
+libmpv owns both audio and video timing. `hwdec=auto-safe` requests a supported hardware decoder; software decoding remains possible. Read `PlaybackStatistics.RenderingPath`: `hwdec=vaapi`, `nvdec`, etc. identify the selected decoder; `hwdec=no` means software decoding despite GPU display. A `-copy` decoder may read decoded frames back to CPU memory. Only the active non-copy hardware path avoids that decoder readback. OpenGL initialization failure falls back to FFmpeg; later renderer/player failures attempt to continue from the current position using FFmpeg. `AVALONIA_NATIVE_MEDIA_DISABLE_MPV=1` forces the legacy path for troubleshooting. Headless and audio-only playback still use FFmpeg.
+
+On this path, frame counters count Render API updates, not confirmed compositor completions or physical display scanout. The busy counter records coalesced update notifications; it is not a dropped-frame counter. `LastTransferMilliseconds` measures CPU render-submission time. The Demo displays these diagnostics below the video.
+
+#### macOS: AVFoundation / IOSurface
+
+The player requests IOSurface-backed, Metal-compatible BGRA CoreVideo buffers and imports them through Avalonia's supported IOSurface interface. AVPlayer continues to handle playback/audio synchronization; no Metal window is placed over the UI. Buffers are retained until compositor import/update/disposal completes, with one pending import to bound memory. Unsupported interop, missing IOSurfaces or device loss falls back to CPU bitmaps. Switching source/seek invalidates queued older frames. Both Apple Silicon and Intel CMTime calling conventions are handled.
+
+Use `PlaybackQuality="Original"` for the high-frame-rate GPU path. Presets requiring downscaling currently use the CPU scaling fallback on macOS; the reason is exposed in `PlaybackStatistics.FallbackReason`. AVFoundation chooses the decoder; IOSurface presentation alone does not prove hardware decoding. BGRA8 output is not HDR passthrough. Linux/macOS code has been cross-compiled on Windows, **not playback-tested on either target OS**. Validate local playback, audio sync, seek, pause, looping, overlays, fullscreen and shutdown on the target machine before release.
 
 ### Playback bindings and time values
 
@@ -174,7 +206,8 @@ string timeLabel = $"{Player.CurrentTimeText} / {Player.DurationText}";
 | `IsStreaming` | `bool` | Whether the source is HTTP or HTTPS. |
 | `SourceKind` | `MediaSourceKind` | `None`, `LocalFile`, `FileUri`, `Http`, or `Https`. |
 | `ControlsVisible` / `CenterPlayVisible` | `bool` | Current visibility of the default control bar and center play button. |
-| `VideoFrame` | `Bitmap?` | Current composited video frame, owned by the player. Do not dispose it yourself. |
+| `VideoFrame` | `Bitmap?` | CPU fallback frame, owned by the player; null during GPU presentation. Do not dispose it yourself. |
+| `PlaybackStatistics` | `VideoPlaybackStatistics?` | Windows rendering path and submission/composition counters; C# snapshot getter. |
 | `UsesCompositedVideo` / `UsesNativeVideoSurface` | `bool` | Video presentation path; the default desktop backends use composited video. |
 
 For video, buffering ends after a new frame actually passes through the Avalonia render path. After seeking, the indicator waits for the target picture; it does not simply disappear on a fixed timeout. During network playback, a gap of roughly 700 ms without meaningful progress can show the indicator again.
@@ -252,9 +285,9 @@ Use `ShowControls="False"` to hide the default controls, or replace the `Control
 
 | Platform | Default backend | Runtime |
 | --- | --- | --- |
-| Windows | `WindowsMediaFoundationBackend` | Windows Media Foundation / MFPlay, including `mfplat.dll`. |
+| Windows | `WindowsMediaFoundationBackend` | Media Engine + D3D11 video; MFPlay for audio/CPU fallback, including `mfplat.dll`. |
 | macOS | `MacAvFoundationBackend` | System AVFoundation, CoreVideo, and QuartzCore frameworks. |
-| Linux | `LinuxFfmpegBackend` | `ffmpeg` and `ffprobe` available on `PATH`, plus an audio output service/device. |
+| Linux | `LinuxFfmpegBackend` | Optional system libmpv + GPU/OpenGL drivers for video; `ffmpeg`/`ffprobe` on `PATH` for fallback/audio-only playback, plus an audio service/device. |
 
 On Ubuntu or Debian, install FFmpeg if needed:
 
@@ -271,7 +304,7 @@ MediaRuntimeOptions.AutoInstallLinuxRuntime = false;
 
 The default is `true`. `LinuxRuntimeInstaller.EnsureFfmpegAsync()` is also available in `NativeMedia.Avalonia.Linux`. The installer recognizes apt, dnf/yum, pacman, zypper, apk, xbps, and emerge; installation depends on configured repositories, privileges, and network access.
 
-Linux desktop playback automatically prefers PulseAudio; PipeWire desktops can provide the same output through `pipewire-pulse`. Automatic selection can fall back to ALSA if Pulse output fails.
+The Linux FFmpeg fallback automatically prefers PulseAudio; PipeWire desktops can provide the same output through `pipewire-pulse`. Automatic selection can fall back to ALSA if Pulse output fails. These FFmpeg sink settings do not control libmpv, which selects its own native audio output.
 
 | Environment variable | Purpose |
 | --- | --- |
@@ -311,13 +344,13 @@ Run from the repository root:
 ```bash
 dotnet restore NativeMedia.Avalonia.sln
 dotnet build NativeMedia.Avalonia.sln -c Release
-dotnet pack src/NativeMedia.Avalonia/NativeMedia.Avalonia.csproj -c Release --no-restore -p:Version=1.0.13
+dotnet pack src/NativeMedia.Avalonia/NativeMedia.Avalonia.csproj -c Release --no-restore -p:Version=1.0.17
 ```
 
 The explicit `Version` property sets the package version. Output:
 
 ```text
-artifacts/packages/NativeMedia.Avalonia.1.0.13.nupkg
+artifacts/packages/NativeMedia.Avalonia.1.0.17.nupkg
 ```
 
 Run the unit tests separately when needed:
@@ -363,7 +396,11 @@ MIT License. See [LICENSE](LICENSE).
 
 面向 **Avalonia 12.1.1 / .NET 10** 的轻量级音视频播放组件库。提供 `VideoPlayer` 和 `AudioPlayer` 控件，分别调用 Windows Media Foundation、macOS AVFoundation 或 Linux FFmpeg 完成播放。
 
-本文对应 **1.0.13** 版本的源码和 API。
+本文对应 **1.0.17** 版本的源码和 API。
+
+1.0.17 在 Windows Media Engine／D3D11 路径基础上，新增可选的 Linux libmpv／OpenGL 显示与 macOS AVFoundation／IOSurface 导入。三端都保留在 Avalonia 合成树内。实际硬解能力仍取决于编码格式、原生播放器、显卡及驱动，并保留 CPU 回退。
+
+1.0.14 修复了 .NET 11 以及 `net10.0-windows`、`net11.0-windows` 等平台专用目标框架的后端自动注册。库本身仍以 .NET 10 为目标，兼容的更高版本应用无需手动注册后端。旧包将自动注册限制为完全匹配 `net10.0`，其他兼容框架可能因此没有实际音视频输出。
 
 ### 功能
 
@@ -380,7 +417,7 @@ MIT License. See [LICENSE](LICENSE).
 从已配置的 NuGet 包源安装：
 
 ```bash
-dotnet add package NativeMedia.Avalonia --version 1.0.13
+dotnet add package NativeMedia.Avalonia --version 1.0.17
 ```
 
 使用本地生成的包时，请先把本仓库的 `artifacts/packages` 目录添加为 NuGet 包源。包内包含核心库和三个平台适配程序集，不附带 FFmpeg 或操作系统媒体框架。
@@ -475,7 +512,35 @@ Player.PlaybackQuality = VideoPlaybackQuality.Original;
 
 `Original` 是这里的“原画／无损播放”档，含义是不额外降低分辨率、不主动压低源帧率。当前使用 BGRA 图像合成，不承诺 HDR／10-bit 的逐位无损。实际显示帧率受解码、像素拷贝、UI 渲染和屏幕刷新率限制；当显示跟不上时，控件只保留最新待显示帧，避免原画帧在内存中无限堆积。
 
-Windows 按原生视频尺寸创建捕获表面；Windows 和 macOS 的取帧跟随宿主渲染节奏。Linux 使用携带尺寸信息的未压缩 BMP 帧，原画档不添加缩放或抽帧滤镜。Linux 播放中切换等级会在当前位置重新启动 FFmpeg，可能出现短暂缓冲。
+Windows 在 `Original` 档按原生尺寸创建 D3D11 纹理，其他质量档在 GPU 上缩放，解码设备匹配 Avalonia 显卡，并使用最多三张纹理。Windows 和 macOS 的取帧跟随宿主渲染节奏。Linux libmpv 直接渲染到 Avalonia OpenGL 帧缓冲，预设限制显示分辨率／帧率，而非源解码器。FFmpeg 回退仍使用未压缩 BMP 帧，原画档不添加缩放或抽帧滤镜；回退路径切换质量会在当前位置重启 FFmpeg，可能短暂缓冲。macOS 中需要缩小分辨率的预设使用 CPU 位图缩放；`Original` 及尺寸已在预设范围内的源可使用 IOSurface。
+
+### GPU 播放与诊断
+
+使用普通 `VideoPlayer` 模板并将控件挂到窗口中，播放 4K／高帧率视频时保留 `PlaybackQuality="Original"`。没有额外的视频 HWND 盖在 Avalonia 上面，覆盖层、按钮、裁剪和变换仍在 Avalonia 视觉／合成树中。GPU 路径需要 Windows 8+ Media Engine、支持视频的硬件 D3D11 设备，以及支持 D3D11 共享纹理／keyed mutex 的 Avalonia 渲染器。远程桌面、软件渲染、互操作不可用或设备故障时可能回退 CPU 截图，原因见 `RuntimeStatus` 和 `PlaybackStatistics.FallbackReason`。
+
+```csharp
+var stats = Player.PlaybackStatistics;
+// RenderingPath 为 "D3D11 shared texture / Media Engine" 时正在使用 GPU 路径。
+// SubmittedFrames / CompositedFrames：当前媒体的提交／合成计数，不代表屏幕实际刷新帧率。
+// PresentationBusyCount：纹理全忙而跳过的取帧请求数，不是解码器丢帧数。
+// LastTransferMilliseconds：CPU 提交上一次 GPU 传输的耗时，不是 GPU 执行耗时。
+```
+
+`PlaybackStatistics` 是按需读取的 C# 快照属性，并非可绑定的实时 FPS 属性。GPU 路径下 `VideoFrame` 为 null，避免为了暴露位图而回读像素。仍有 GPU 内部传输、色彩转换和合成，因此准确说法是**不回读 CPU**，不是 GPU 内部完全零复制。当前输出为 BGRA8 SDR，不是逐位无损的 10-bit／HDR 直通。显示 4K120 需要至少 120 Hz 的屏幕／合成器和相应硬解能力，不能承诺任意硬件零丢帧。本版本已编译，4K120 实际播放及覆盖层性能仍需在目标机器验证。
+
+#### Linux：libmpv／OpenGL
+
+默认 `LinuxFfmpegBackend` 现在优先为已挂载的视频控件尝试系统 `libmpv.so.2` 或 `libmpv.so.1`。请安装发行版提供的 **libmpv 运行库**及适配显卡的 GPU／VA-API／NVIDIA 驱动。仅安装 `mpv` 命令行程序不一定包含共享库。本组件不会下载或安装 libmpv。Avalonia 渲染器必须支持 OpenGL 合成／纹理共享；Intel VA-API 互操作通常需要 EGL。实现向渲染接口提供 X11／Wayland 显示连接，并随渲染器释放。
+
+libmpv 同时负责音视频时钟，使用 `hwdec=auto-safe` 请求受支持的硬件解码，但仍可能选择软解。查看 `PlaybackStatistics.RenderingPath`：`hwdec=vaapi`、`nvdec` 等表示所选解码器，`hwdec=no` 表示“软解 + GPU 显示”；带 `-copy` 的解码器可能将解码帧回读 CPU。只有实际启用非 copy 硬解路径，才能避免这一步回读。OpenGL 初始化失败时回退 FFmpeg；播放中渲染器／播放器故障会尝试从当前位置继续使用 FFmpeg。设置 `AVALONIA_NATIVE_MEDIA_DISABLE_MPV=1` 可强制旧路径排查问题。无界面模式和纯音频播放仍使用 FFmpeg。
+
+该路径的帧计数是 Render API 更新次数，不代表已完成合成或屏幕实际扫描输出；busy 计数表示合并的更新通知，不是丢帧数。`LastTransferMilliseconds` 是 CPU 提交渲染的耗时。Demo 在视频下方显示这些诊断信息。
+
+#### macOS：AVFoundation／IOSurface
+
+播放器请求 IOSurface 支持、兼容 Metal 的 BGRA CoreVideo 缓冲区，通过 Avalonia 的 IOSurface 接口导入。播放与音频同步继续由 AVPlayer 负责，不在 UI 上方叠加 Metal 原生窗口。缓冲区会持有到合成器完成导入、更新和释放；最多一个待处理导入，避免内存堆积。互操作不可用、没有 IOSurface 或设备丢失时回退 CPU 位图。切换来源／拖动进度会使已排队的旧帧失效，同时兼容 Apple Silicon 和 Intel 的 CMTime 调用约定。
+
+高帧率 GPU 播放请用 `PlaybackQuality="Original"`。macOS 需要缩小分辨率的预设暂时走 CPU 缩放回退，原因可从 `PlaybackStatistics.FallbackReason` 查看。解码器由 AVFoundation 选择，IOSurface 显示本身不等于确认硬解；BGRA8 输出不是 HDR 直通。Linux／macOS 代码目前仅在 Windows 上完成交叉编译，**尚未在对应系统实测播放**。发布前请在目标机器验证本地播放、音画同步、拖动、暂停、循环、覆盖层、全屏和关闭释放。
 
 ### 播放绑定与时间属性
 
@@ -531,7 +596,8 @@ string timeLabel = $"{Player.CurrentTimeText} / {Player.DurationText}";
 | `IsStreaming` | `bool` | 媒体源是否为 HTTP 或 HTTPS。 |
 | `SourceKind` | `MediaSourceKind` | `None`、`LocalFile`、`FileUri`、`Http` 或 `Https`。 |
 | `ControlsVisible` / `CenterPlayVisible` | `bool` | 当前默认控制栏和中央播放按钮的可见状态。 |
-| `VideoFrame` | `Bitmap?` | 当前合成视频帧，由播放器持有，请勿自行释放。 |
+| `VideoFrame` | `Bitmap?` | CPU 回退帧，由播放器持有；GPU 显示时为 null，请勿自行释放。 |
+| `PlaybackStatistics` | `VideoPlaybackStatistics?` | Windows 显示路径及提交／合成计数；C# 快照属性。 |
 | `UsesCompositedVideo` / `UsesNativeVideoSurface` | `bool` | 视频显示方式；默认桌面后端使用合成视频。 |
 
 视频缓冲状态会等待新画面真正进入 Avalonia 渲染流程后结束。跳转后也会等待目标位置的画面，不会仅依赖固定超时隐藏加载动画。网络播放期间约 700 毫秒没有有效进度时，可能再次显示缓冲状态。
@@ -609,9 +675,9 @@ Player.Error += (_, e) => System.Diagnostics.Debug.WriteLine(e.Message);
 
 | 平台 | 默认后端 | 运行时要求 |
 | --- | --- | --- |
-| Windows | `WindowsMediaFoundationBackend` | Windows Media Foundation／MFPlay，包括 `mfplat.dll`。 |
+| Windows | `WindowsMediaFoundationBackend` | Media Engine + D3D11 视频；MFPlay 音频／CPU 回退，包括 `mfplat.dll`。 |
 | macOS | `MacAvFoundationBackend` | 系统 AVFoundation、CoreVideo 和 QuartzCore 框架。 |
-| Linux | `LinuxFfmpegBackend` | `PATH` 中可找到 `ffmpeg` 和 `ffprobe`，并具备音频服务或输出设备。 |
+| Linux | `LinuxFfmpegBackend` | 视频 GPU 路径可选安装系统 libmpv 和 GPU／OpenGL 驱动；回退／纯音频需要 `PATH` 中的 `ffmpeg`、`ffprobe`，另需音频服务或输出设备。 |
 
 Ubuntu、Debian 可以按需安装 FFmpeg：
 
@@ -628,7 +694,7 @@ MediaRuntimeOptions.AutoInstallLinuxRuntime = false;
 
 默认值是 `true`。`NativeMedia.Avalonia.Linux` 命名空间还提供 `LinuxRuntimeInstaller.EnsureFfmpegAsync()`。安装器识别 apt、dnf/yum、pacman、zypper、apk、xbps 和 emerge，能否安装取决于已配置的软件仓库、权限和网络。
 
-Linux 桌面自动优先选择 PulseAudio；PipeWire 桌面可通过 `pipewire-pulse` 使用同一输出路径。自动选择模式下，Pulse 输出失败可以回退到 ALSA。
+Linux 的 FFmpeg 回退自动优先选择 PulseAudio；PipeWire 桌面可通过 `pipewire-pulse` 使用同一输出路径。自动模式下，Pulse 输出失败可回退 ALSA。这些 FFmpeg 音频输出设置不控制 libmpv，后者自行选择原生音频输出。
 
 | 环境变量 | 说明 |
 | --- | --- |
@@ -668,13 +734,13 @@ Linux 程序集中还保留了可选的 GStreamer 后端。如果应用使用该
 ```bash
 dotnet restore NativeMedia.Avalonia.sln
 dotnet build NativeMedia.Avalonia.sln -c Release
-dotnet pack src/NativeMedia.Avalonia/NativeMedia.Avalonia.csproj -c Release --no-restore -p:Version=1.0.13
+dotnet pack src/NativeMedia.Avalonia/NativeMedia.Avalonia.csproj -c Release --no-restore -p:Version=1.0.17
 ```
 
 命令中的 `Version` 参数明确指定包版本，输出位置为：
 
 ```text
-artifacts/packages/NativeMedia.Avalonia.1.0.13.nupkg
+artifacts/packages/NativeMedia.Avalonia.1.0.17.nupkg
 ```
 
 需要时单独执行单元测试：

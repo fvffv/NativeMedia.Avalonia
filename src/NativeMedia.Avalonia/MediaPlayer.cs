@@ -140,6 +140,8 @@ public abstract class MediaPlayer : TemplatedControl, IAsyncDisposable, IDisposa
     }
     /// <summary>当前注册的平台后端名称。<para>Name of the registered platform backend.</para></summary>
     public string BackendName => _backend.Name;
+    /// <summary>GPU submission/composition counters; not a physical display FPS measurement.</summary>
+    public VideoPlaybackStatistics? PlaybackStatistics => (_backend as IGpuVideoBackend)?.PlaybackStatistics;
     /// <summary>当前平台播放运行时是否可用。<para>Whether the selected platform runtime is available.</para></summary>
     public bool BackendAvailable => _backend.IsAvailable;
     /// <summary>媒体源路径或网络 URL。支持本地路径、file URI、HTTP 和 HTTPS。<para>Media path or network URL. Supports local paths, file URIs, HTTP, and HTTPS.</para></summary>
@@ -274,6 +276,16 @@ public abstract class MediaPlayer : TemplatedControl, IAsyncDisposable, IDisposa
             // native UI thread, so Source changes are deferred until the host
             // window has had a chance to render before that short setup runs.
             var quality = PlaybackQuality;
+            // Linux/macOS startup runs on the backend worker, but template and
+            // visual-tree access must always happen on the Avalonia UI thread.
+            if (this is VideoPlayer && _backend is IGpuVideoBackend gpu)
+            {
+                await Dispatcher.UIThread.InvokeAsync(() =>
+                {
+                    ApplyTemplate();
+                    gpu.SetPresentationSurface(_videoFrameSurface);
+                });
+            }
             await RunBackendOperationAsync(async backend =>
             {
                 if (this is VideoPlayer && backend is IVideoQualityMediaBackend configurable)
@@ -759,6 +771,7 @@ public abstract class MediaPlayer : TemplatedControl, IAsyncDisposable, IDisposa
         _volumeSlider = e.NameScope.Find<Slider>("PART_VolumeSlider");
         _videoSurface = e.NameScope.Find<NativeMediaSurface>("PART_VideoSurface");
         _videoFrameSurface = e.NameScope.Find<VideoFrameSurface>("PART_VideoFrameSurface");
+        if (_backend is IGpuVideoBackend gpuBackend) gpuBackend.SetPresentationSurface(_videoFrameSurface);
         if (_videoFrameSurface is not null) _videoFrameSurface.FrameRendered += VideoFrameSurfaceRendered;
         _controlOverlay = e.NameScope.Find<Control>("PART_ControlOverlay");
         if (_videoSurface is not null) _videoSurface.Backend = _backend;
@@ -861,6 +874,7 @@ public abstract class MediaPlayer : TemplatedControl, IAsyncDisposable, IDisposa
         _videoSurface = null;
         if (_videoFrameSurface is not null) _videoFrameSurface.FrameRendered -= VideoFrameSurfaceRendered;
         _videoFrameSurface = null;
+        if (_backend is IGpuVideoBackend gpuBackend) gpuBackend.SetPresentationSurface(null);
         _controlOverlay = null;
         if (_playButton is not null) _playButton.Click -= PlayClick;
         if (_centerPlayButton is not null) _centerPlayButton.Click -= PlayClick;
@@ -910,6 +924,22 @@ public abstract class MediaPlayer : TemplatedControl, IAsyncDisposable, IDisposa
     private static string FormatTime(TimeSpan value) => value.TotalHours >= 1 ? value.ToString(@"hh\:mm\:ss") : value.ToString(@"mm\:ss");
     private void Subscribe(IMediaBackend b)
     {
+        if (b is IGpuVideoBackend gpu)
+            gpu.GpuFramePresented += (_, frame) => OnUi(() =>
+            {
+                if (_disposed) return;
+                if (_videoFrame is { } cpuFrame)
+                {
+                    _videoFrame = null;
+                    RaisePropertyChanged(VideoFrameProperty, cpuFrame, null);
+                    cpuFrame.Dispose();
+                }
+                _lastVideoFramePosition = frame.Position;
+                _lastVideoFrameCapturedTimestamp = frame.CapturedTimestamp;
+                _lastVideoFrameContentHash = 0; // Media Engine provides the actual frame PTS.
+                _videoFrameNeedsRender = true;
+                VideoFrameSurfaceRendered(this, EventArgs.Empty);
+            });
         b.Opened += (_, e) => OnUi(() => { SetState(MediaState.Ready); ClearRuntimeStatus(); Opened?.Invoke(this, e); });
         b.Playing += (_, e) => OnUi(() => { SetPlaying(true); SetState(MediaState.Playing); Playing?.Invoke(this, e); });
         b.Paused += (_, e) => OnUi(() => { StopBufferingMonitor(); SetPlaying(false); SetControlsVisible(true); SetState(MediaState.Paused); Paused?.Invoke(this, e); });

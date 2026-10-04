@@ -7,12 +7,20 @@ namespace NativeMedia.Avalonia.macOS;
 
 /// <summary>
 /// Native macOS backend based on AVPlayer and AVPlayerItemVideoOutput.
-/// AVFoundation owns playback and audio synchronization; decoded BGRA frames
-/// are copied from CoreVideo into Avalonia so normal Avalonia controls can be
-/// composited above the video.
+/// AVFoundation owns playback and audio synchronization. IOSurface-backed frames
+/// are imported by Avalonia; unsupported renderers retain a CPU bitmap fallback.
 /// </summary>
-public sealed class MacAvFoundationBackend : NativeMediaBackend, IVideoMediaBackend, IVideoQualityMediaBackend, IVideoFrameClockBackend
+public sealed class MacAvFoundationBackend : NativeMediaBackend, IVideoMediaBackend, IVideoQualityMediaBackend, IVideoFrameClockBackend, IGpuVideoBackend
 {
+    private VideoFrameSurface? _presentationSurface;
+    private IosurfaceVideoPresenter? _gpu;
+    private string? _gpuFallback;
+    private bool _usingGpu;
+    public event EventHandler<GpuVideoFramePresentedEventArgs>? GpuFramePresented;
+    public VideoPlaybackStatistics PlaybackStatistics => _usingGpu && _gpu is { } gpu
+        ? gpu.Statistics : new("AVFoundation / CPU bitmap", 0, 0, 0, 0, _gpuFallback);
+    public void SetPresentationSurface(VideoFrameSurface? surface) => _presentationSurface = surface;
+
     private const uint PixelFormat32Bgra = 0x42475241; // 'BGRA'
     private readonly object _nativeGate = new();
     private nint _player;
@@ -20,6 +28,9 @@ public sealed class MacAvFoundationBackend : NativeMediaBackend, IVideoMediaBack
     private nint _videoOutput;
     private Timer? _frameTimer;
     private Timer? _durationTimer;
+    private Timer? _positionTimer;
+    private long _nativePositionTicks;
+    private int _nativeGeneration;
     private byte[] _rowBuffer = [];
     private int _readingFrame;
     private bool _disposed;
@@ -40,6 +51,8 @@ public sealed class MacAvFoundationBackend : NativeMediaBackend, IVideoMediaBack
         {
             _playbackQuality = quality;
             _lastPublishedFramePosition = null;
+            ++_nativeGeneration;
+            _gpu?.Invalidate();
         }
         return Task.CompletedTask;
     }
@@ -94,8 +107,38 @@ public sealed class MacAvFoundationBackend : NativeMediaBackend, IVideoMediaBack
         cancellationToken.ThrowIfCancellationRequested();
         lock (_nativeGate)
         {
-            if (_disposed) return;
+            _gpu?.Dispose();
+            _gpu = null;
+            _usingGpu = false;
             CloseNativePlayerLocked();
+        }
+        _gpuFallback = null;
+        if (_videoOutputEnabled && _presentationSurface is { } surface)
+        {
+            try
+            {
+                var target = await global::Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(async () =>
+                {
+                    surface.HideGpuFrame();
+                    return await surface.GetGpuTargetAsync(cancellationToken);
+                });
+                if (target is not null && IosurfaceVideoPresenter.IsSupported(target))
+                {
+                    _gpu = new(surface, target);
+                    _gpu.Presented += (_, e) => GpuFramePresented?.Invoke(this, e);
+                    _gpu.Failed += reason => { _usingGpu = false; _gpuFallback = reason; RaiseRuntimeStatus("IOSurface unavailable; using CPU bitmap: " + reason); };
+                }
+                else _gpuFallback = "Avalonia does not expose IOSurface automatic image import.";
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) { _gpuFallback = ex.Message; }
+        }
+        else if (_videoOutputEnabled) _gpuFallback = "No Avalonia presentation surface is attached.";
+        lock (_nativeGate)
+        {
+            if (_disposed) { _gpu?.Dispose(); return; }
+            CloseNativePlayerLocked();
+            using var pool = new Native.AutoreleasePool();
 
             var text = Native.String(uri!.IsFile ? uri.LocalPath : source);
             var url = kind is MediaSourceKind.Http or MediaSourceKind.Https
@@ -127,6 +170,7 @@ public sealed class MacAvFoundationBackend : NativeMediaBackend, IVideoMediaBack
             if (_videoOutput != 0)
                 _frameTimer = new Timer(_ => RequestVideoFrame(), null, _externalFrameClock ? Timeout.Infinite : 0, 1);
             _durationTimer = new Timer(_ => PollDuration(), null, 100, 250);
+            _positionTimer = new Timer(_ => PollNativePosition(), null, 0, 20);
         }
 
         await base.OpenAsync(source, cancellationToken);
@@ -137,11 +181,12 @@ public sealed class MacAvFoundationBackend : NativeMediaBackend, IVideoMediaBack
     private static nint CreateVideoOutput()
     {
         var pixelFormat = Native.SendUInt(Native.Class("NSNumber"), Native.Selector("numberWithUnsignedInt:"), PixelFormat32Bgra);
-        var attributes = Native.Send(
-            Native.Class("NSDictionary"),
-            Native.Selector("dictionaryWithObject:forKey:"),
-            pixelFormat,
-            Native.PixelFormatTypeKey);
+        var attributes = Native.Send(Native.Class("NSMutableDictionary"), Native.Selector("dictionary"));
+        Native.Send(attributes, Native.Selector("setObject:forKey:"), pixelFormat, Native.PixelFormatTypeKey);
+        var empty = Native.Send(Native.Class("NSDictionary"), Native.Selector("dictionary"));
+        Native.Send(attributes, Native.Selector("setObject:forKey:"), empty, Native.IOSurfacePropertiesKey);
+        var yes = Native.SendUInt(Native.Class("NSNumber"), Native.Selector("numberWithUnsignedInt:"), 1);
+        Native.Send(attributes, Native.Selector("setObject:forKey:"), yes, Native.MetalCompatibilityKey);
         var output = Native.Send(Native.Class("AVPlayerItemVideoOutput"), Native.Selector("alloc"));
         return output == 0
             ? 0
@@ -174,6 +219,8 @@ public sealed class MacAvFoundationBackend : NativeMediaBackend, IVideoMediaBack
         lock (_nativeGate)
         {
             if (_disposed) return;
+            ++_nativeGeneration;
+            _gpu?.Invalidate();
             if (_player != 0)
             {
                 Native.SendVoid(_player, Native.Selector("pause"));
@@ -185,9 +232,12 @@ public sealed class MacAvFoundationBackend : NativeMediaBackend, IVideoMediaBack
 
     public override void Seek(TimeSpan position)
     {
+        Interlocked.Exchange(ref _nativePositionTicks, Math.Max(0, position.Ticks));
         lock (_nativeGate)
         {
             if (_disposed) return;
+            ++_nativeGeneration;
+            _gpu?.Invalidate();
             _lastPublishedFramePosition = null;
             if (_player != 0)
             {
@@ -204,11 +254,14 @@ public sealed class MacAvFoundationBackend : NativeMediaBackend, IVideoMediaBack
     }
 
     protected override TimeSpan QueryPosition()
+        => TimeSpan.FromTicks(Interlocked.Read(ref _nativePositionTicks));
+
+    private void PollNativePosition()
     {
         lock (_nativeGate)
         {
-            if (_disposed || _player == 0) return base.QueryPosition();
-            return Native.SendTimeResult(_player, Native.Selector("currentTime")).ToTimeSpan();
+            if (_disposed || _player == 0) return;
+            Interlocked.Exchange(ref _nativePositionTicks, Native.SendTimeResult(_player, Native.Selector("currentTime")).ToTimeSpan().Ticks);
         }
     }
 
@@ -273,6 +326,8 @@ public sealed class MacAvFoundationBackend : NativeMediaBackend, IVideoMediaBack
     {
         if (Interlocked.Exchange(ref _readingFrame, 1) != 0) return;
         nint pixelBuffer = 0;
+        IosurfaceVideoPresenter? presenter = null;
+        int generation = 0;
         var framePosition = TimeSpan.Zero;
         VideoPlaybackProfile profile = default;
         try
@@ -280,6 +335,8 @@ public sealed class MacAvFoundationBackend : NativeMediaBackend, IVideoMediaBack
             lock (_nativeGate)
             {
                 if (_disposed || _videoOutput == 0 || _player == 0) return;
+                presenter = _gpu;
+                generation = _nativeGeneration;
                 var itemTime = Native.SendTimeForDouble(
                     _videoOutput,
                     Native.Selector("itemTimeForHostTime:"),
@@ -301,7 +358,11 @@ public sealed class MacAvFoundationBackend : NativeMediaBackend, IVideoMediaBack
                 if (pixelBuffer != 0) _lastPublishedFramePosition = framePosition;
             }
 
-            if (pixelBuffer != 0) PublishPixelBuffer(pixelBuffer, framePosition, profile);
+            lock (_nativeGate)
+            {
+                if (pixelBuffer != 0 && !_disposed && generation == _nativeGeneration)
+                    PublishPixelBuffer(pixelBuffer, framePosition, profile, presenter);
+            }
         }
         catch (Exception ex)
         {
@@ -314,9 +375,21 @@ public sealed class MacAvFoundationBackend : NativeMediaBackend, IVideoMediaBack
         }
     }
 
-    private void PublishPixelBuffer(nint pixelBuffer, TimeSpan framePosition, VideoPlaybackProfile profile)
+    private void PublishPixelBuffer(nint pixelBuffer, TimeSpan framePosition, VideoPlaybackProfile profile, IosurfaceVideoPresenter? presenter)
     {
         if (Native.CVPixelBufferGetPixelFormatType(pixelBuffer) != PixelFormat32Bgra) return;
+        var gpuSize = new PixelSize(checked((int)Native.CVPixelBufferGetWidth(pixelBuffer)), checked((int)Native.CVPixelBufferGetHeight(pixelBuffer)));
+        if (gpuSize.Width <= 0 || gpuSize.Height <= 0) return;
+        if (gpuSize.Width > 0 && gpuSize.Height > 0 && profile.GetOutputSize(gpuSize.Width, gpuSize.Height) == gpuSize
+            && presenter?.TryPresent(pixelBuffer, gpuSize, framePosition) == true)
+        { _usingGpu = true; return; }
+        if (_usingGpu)
+        {
+            _usingGpu = false;
+            global::Avalonia.Threading.Dispatcher.UIThread.Post(() => _presentationSurface?.HideGpuFrame());
+        }
+        if (profile.MaximumLongEdge > 0 && profile.GetOutputSize(gpuSize.Width, gpuSize.Height) != gpuSize)
+            _gpuFallback = "This quality preset requires downscaling; macOS uses the CPU scaling fallback. Use Original for IOSurface presentation.";
         if (Native.CVPixelBufferLockBaseAddress(pixelBuffer, 1) != 0) return;
         try
         {
@@ -391,6 +464,7 @@ public sealed class MacAvFoundationBackend : NativeMediaBackend, IVideoMediaBack
         {
             if (_disposed) return;
             _disposed = true;
+            _gpu?.Dispose();
             CloseNativePlayerLocked();
         }
         base.Dispose();
@@ -398,6 +472,10 @@ public sealed class MacAvFoundationBackend : NativeMediaBackend, IVideoMediaBack
 
     private void CloseNativePlayerLocked()
     {
+        ++_nativeGeneration;
+        _positionTimer?.Dispose();
+        _positionTimer = null;
+        Interlocked.Exchange(ref _nativePositionTicks, 0);
         _lastPublishedFramePosition = null;
         _frameTimer?.Dispose();
         _frameTimer = null;
@@ -435,6 +513,13 @@ public sealed class MacAvFoundationBackend : NativeMediaBackend, IVideoMediaBack
 
     private static class Native
     {
+        internal sealed class AutoreleasePool : IDisposable
+        {
+            private readonly nint _pool = objc_autoreleasePoolPush();
+            public void Dispose() => objc_autoreleasePoolPop(_pool);
+        }
+        [DllImport(ObjC)] private static extern nint objc_autoreleasePoolPush();
+        [DllImport(ObjC)] private static extern void objc_autoreleasePoolPop(nint pool);
         internal const string AvFoundation = "/System/Library/Frameworks/AVFoundation.framework/AVFoundation";
         internal const string CoreVideo = "/System/Library/Frameworks/CoreVideo.framework/CoreVideo";
         internal const string QuartzCore = "/System/Library/Frameworks/QuartzCore.framework/QuartzCore";
@@ -444,6 +529,8 @@ public sealed class MacAvFoundationBackend : NativeMediaBackend, IVideoMediaBack
         private static readonly nint CoreVideoHandle = NativeLibrary.Load(CoreVideo);
 
         internal static nint PixelFormatTypeKey { get; } = ReadExportedObject("kCVPixelBufferPixelFormatTypeKey");
+        internal static nint IOSurfacePropertiesKey { get; } = ReadExportedObject("kCVPixelBufferIOSurfacePropertiesKey");
+        internal static nint MetalCompatibilityKey { get; } = ReadExportedObject("kCVPixelBufferMetalCompatibilityKey");
 
         private static nint ReadExportedObject(string name)
         {
@@ -463,8 +550,20 @@ public sealed class MacAvFoundationBackend : NativeMediaBackend, IVideoMediaBack
         [DllImport(ObjC, EntryPoint = "objc_msgSend")] internal static extern void SendFloat(nint target, nint selector, float value);
         [DllImport(ObjC, EntryPoint = "objc_msgSend")] internal static extern void SendTime(nint target, nint selector, CMTime value);
         [DllImport(ObjC, EntryPoint = "objc_msgSend")] internal static extern void SendThreeTimes(nint target, nint selector, CMTime value, CMTime toleranceBefore, CMTime toleranceAfter);
-        [DllImport(ObjC, EntryPoint = "objc_msgSend")] internal static extern CMTime SendTimeResult(nint target, nint selector);
-        [DllImport(ObjC, EntryPoint = "objc_msgSend")] internal static extern CMTime SendTimeForDouble(nint target, nint selector, double value);
+        [DllImport(ObjC, EntryPoint = "objc_msgSend")] private static extern CMTime SendTimeArm(nint target, nint selector);
+        [DllImport(ObjC, EntryPoint = "objc_msgSend")] private static extern CMTime SendTimeDoubleArm(nint target, nint selector, double value);
+        [DllImport(ObjC, EntryPoint = "objc_msgSend_stret")] private static extern void SendTimeIntel(out CMTime result, nint target, nint selector);
+        [DllImport(ObjC, EntryPoint = "objc_msgSend_stret")] private static extern void SendTimeDoubleIntel(out CMTime result, nint target, nint selector, double value);
+        internal static CMTime SendTimeResult(nint target, nint selector)
+        {
+            if (RuntimeInformation.ProcessArchitecture != Architecture.X64) return SendTimeArm(target, selector);
+            SendTimeIntel(out var result, target, selector); return result;
+        }
+        internal static CMTime SendTimeForDouble(nint target, nint selector, double value)
+        {
+            if (RuntimeInformation.ProcessArchitecture != Architecture.X64) return SendTimeDoubleArm(target, selector, value);
+            SendTimeDoubleIntel(out var result, target, selector, value); return result;
+        }
         [DllImport(ObjC, EntryPoint = "objc_msgSend")]
         [return: MarshalAs(UnmanagedType.I1)]
         internal static extern bool SendBoolForTime(nint target, nint selector, CMTime value);

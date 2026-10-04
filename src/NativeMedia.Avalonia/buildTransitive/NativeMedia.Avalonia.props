@@ -1,5 +1,7 @@
 <Project>
-  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
+  <!-- NuGet selects compatible consumers, including newer and platform-specific TFMs.
+       Do not restrict registration to the library's exact target framework. -->
+  <ItemGroup>
     <Compile Include="$(MSBuildThisFileDirectory)NativeMedia.Avalonia.AutoRegistration.g.cs"
              Link="NativeMedia.Avalonia.AutoRegistration.g.cs"
              Visible="false" />

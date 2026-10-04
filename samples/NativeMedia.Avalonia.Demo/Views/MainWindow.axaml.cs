@@ -2,6 +2,12 @@ using System;
 using System.IO;
 using System.Threading.Tasks;
 using global::Avalonia.Controls;
+using global::Avalonia;
+using global::Avalonia.Controls.Primitives;
+using global::Avalonia.Input;
+using global::Avalonia.Interactivity;
+using global::Avalonia.Layout;
+using global::Avalonia.Threading;
 using global::Avalonia.Platform.Storage;
 using NativeMedia.Avalonia.Demo.ViewModels;
 using NativeMedia.Avalonia;
@@ -10,11 +16,28 @@ namespace NativeMedia.Avalonia.Demo.Views;
 
 public partial class MainWindow : Window
 {
+    private bool _videoFullscreen;
+    private Vector _normalScrollOffset;
+    private readonly DispatcherTimer _diagnosticsTimer = new() { Interval = TimeSpan.FromSeconds(1) };
     public MainWindow()
     {
         InitializeComponent();
+        _diagnosticsTimer.Tick += (_, _) =>
+        {
+            var stats = VideoPlayer.PlaybackStatistics;
+            PlaybackDiagnostics.Text = stats is null ? "" : $"{stats.RenderingPath}\nFrames submitted: {stats.SubmittedFrames}; presentation updates: {stats.CompositedFrames}; busy/coalesced: {stats.PresentationBusyCount}"
+                + (string.IsNullOrEmpty(stats.FallbackReason) ? "" : $"\nFallback: {stats.FallbackReason}");
+        };
+        _diagnosticsTimer.Start();
+        VideoPlayer.FullScreenRequested += (_, _) => UpdateVideoFullscreenLayout();
+        PropertyChanged += (_, change) =>
+        {
+            if (change.Property == WindowStateProperty) UpdateVideoFullscreenLayout();
+        };
+        AddHandler(KeyDownEvent, WindowKeyDown, RoutingStrategies.Tunnel, handledEventsToo: true);
         Closing += (_, _) =>
         {
+            _diagnosticsTimer.Stop();
             VideoPlayer.Dispose();
             AudioPlayer.Dispose();
         };
@@ -23,6 +46,40 @@ public partial class MainWindow : Window
         VideoPlayer.Opened += (_, _) => SetStatus("Video is ready");
         VideoPlayer.Playing += (_, _) => SetStatus("Video is playing");
         AudioPlayer.Opened += (_, _) => SetStatus("Audio is ready");
+    }
+
+    private void UpdateVideoFullscreenLayout()
+    {
+        var fullscreen = WindowState == WindowState.FullScreen;
+        if (fullscreen == _videoFullscreen) return;
+        _videoFullscreen = fullscreen;
+        if (fullscreen) _normalScrollOffset = DemoScroll.Offset;
+
+        // Keep the same VideoPlayer attached: reparenting it would invoke Dispose
+        // in OnDetachedFromVisualTree and destroy the active decoder/GPU surfaces.
+        DemoHeader.IsVisible = !fullscreen;
+        DemoFooter.IsVisible = !fullscreen;
+        DemoLayout.Margin = fullscreen ? new Thickness(0) : new Thickness(28);
+        DemoLayout.MaxWidth = fullscreen ? double.PositiveInfinity : 920;
+        DemoLayout.RowSpacing = fullscreen ? 0 : 18;
+        DemoLayout.RowDefinitions[1].Height = fullscreen ? new GridLength(1, GridUnitType.Star) : GridLength.Auto;
+        DemoScroll.VerticalScrollBarVisibility = fullscreen ? ScrollBarVisibility.Disabled : ScrollBarVisibility.Auto;
+        VideoPlayer.Width = fullscreen ? double.NaN : 720;
+        VideoPlayer.Height = fullscreen ? double.NaN : 400;
+        VideoPlayer.HorizontalAlignment = fullscreen ? HorizontalAlignment.Stretch : HorizontalAlignment.Center;
+        if (fullscreen) DemoScroll.Offset = default;
+        else Dispatcher.UIThread.Post(() =>
+        {
+            // Restore only after the normal scroll extent has been measured again.
+            if (!_videoFullscreen) DemoScroll.Offset = _normalScrollOffset;
+        }, DispatcherPriority.Loaded);
+    }
+
+    private void WindowKeyDown(object? sender, KeyEventArgs e)
+    {
+        if (e.Key != Key.Escape || WindowState != WindowState.FullScreen) return;
+        VideoPlayer.ExitFullscreen();
+        e.Handled = true;
     }
 
     private void PlayerError(object? sender, MediaErrorEventArgs e) => SetStatus(e.Message);

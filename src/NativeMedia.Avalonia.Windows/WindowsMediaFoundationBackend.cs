@@ -9,10 +9,20 @@ using global::Avalonia.Threading;
 
 namespace NativeMedia.Avalonia.Windows;
 
-/// <summary>Media Foundation MFPlay adapter. It uses raw COM vtable calls, which are NativeAOT-safe.</summary>
+/// <summary>Media Engine/D3D11 GPU video with MFPlay fallback and audio. NativeAOT-safe unmanaged COM bindings.</summary>
 [SupportedOSPlatform("windows6.1")]
-public sealed class WindowsMediaFoundationBackend : NativeMediaBackend, IVideoMediaBackend, IVideoQualityMediaBackend, IVideoFrameClockBackend
+public sealed class WindowsMediaFoundationBackend : NativeMediaBackend, IVideoMediaBackend, IVideoQualityMediaBackend, IVideoFrameClockBackend, IGpuVideoBackend
 {
+    private GpuVideoSession? _gpu;
+    private VideoFrameSurface? _presentationSurface;
+    private string? _fallbackReason;
+    private bool _skipGpu;
+    private bool _disposed;
+    private int _openGeneration;
+    public event EventHandler<GpuVideoFramePresentedEventArgs>? GpuFramePresented;
+    public VideoPlaybackStatistics PlaybackStatistics => _gpu?.Statistics
+        ?? new(_videoOutputEnabled ? "MFPlay CPU capture (fallback)" : "MFPlay audio", 0, 0, 0, 0, _fallbackReason);
+    public void SetPresentationSurface(VideoFrameSurface? surface) => _presentationSurface = surface;
     private nint _player;
     private nint _videoOutput;
     private nint _captureWindow;
@@ -42,6 +52,7 @@ public sealed class WindowsMediaFoundationBackend : NativeMediaBackend, IVideoMe
         _ = VideoPlaybackProfile.FromQuality(quality);
         cancellationToken.ThrowIfCancellationRequested();
         _playbackQuality = quality;
+        _gpu?.SetQuality(quality);
         _lastCaptureTimestamp = 0;
         return Task.CompletedTask;
     }
@@ -56,6 +67,7 @@ public sealed class WindowsMediaFoundationBackend : NativeMediaBackend, IVideoMe
     /// <inheritdoc />
     public void RequestVideoFrame()
     {
+        if (_gpu is { } gpu) { gpu.RequestFrame(); return; }
         if (!_videoOutputEnabled || _player == 0 || Interlocked.Exchange(ref _captureQueued, 1) != 0) return;
         var generation = _captureGeneration;
         // HWND resizing/capture stays on its owning thread, outside Avalonia's
@@ -69,14 +81,63 @@ public sealed class WindowsMediaFoundationBackend : NativeMediaBackend, IVideoMe
 
     public override async Task OpenAsync(string source, CancellationToken cancellationToken = default)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        cancellationToken.ThrowIfCancellationRequested();
         if (!OperatingSystem.IsWindows()) { await base.OpenAsync(source, cancellationToken); return; }
         try
         {
+            var generation = ++_openGeneration;
             CloseNativePlayer();
+            _presentationSurface?.HideGpuFrame();
             _source = source;
-            _comInitialized = NativeMethods.CoInitializeEx(IntPtr.Zero, _videoOutputEnabled ? 2u : 0u) >= 0;
-            if (NativeMethods.MFStartup(0x00020070, 0) < 0) { RaiseError("Media Foundation initialization failed."); return; }
-            _mfStarted = true;
+            if (!_comInitialized) _comInitialized = NativeMethods.CoInitializeEx(IntPtr.Zero, _videoOutputEnabled ? 2u : 0u) >= 0;
+            if (!_mfStarted)
+            {
+                if (NativeMethods.MFStartup(0x00020070, 0) < 0) { RaiseError("Media Foundation initialization failed."); return; }
+                _mfStarted = true;
+            }
+            if (!_skipGpu) _fallbackReason = null;
+            if (_videoOutputEnabled && !_skipGpu)
+            {
+                GpuVideoSession? candidate = null;
+                try
+                {
+                    var surface = _presentationSurface;
+                    var target = surface is null ? null : await surface.GetGpuTargetAsync(cancellationToken);
+                    if (generation != _openGeneration || _disposed) return;
+                    if (target is null) throw new NotSupportedException("No Avalonia GPU composition target is attached.");
+                    candidate = new GpuVideoSession(surface!, target, source);
+                    // Keep ownership while awaiting metadata so Dispose/source replacement can cancel it.
+                    _gpu = candidate;
+                    await candidate.Loaded.WaitAsync(TimeSpan.FromSeconds(30), cancellationToken);
+                    if (generation != _openGeneration || _disposed) return;
+                    candidate.SetQuality(_playbackQuality);
+                    candidate.SetVolume(Volume);
+                    candidate.SetMuted(Muted);
+                    candidate.Presented += (_, frame) =>
+                    {
+                        if (ReferenceEquals(_gpu, candidate)) GpuFramePresented?.Invoke(this, frame);
+                    };
+                    candidate.Failed += error => RecoverGpuFailure(candidate, error);
+                    await base.OpenAsync(source, cancellationToken);
+                    if (generation != _openGeneration || _disposed) return;
+                    var duration = candidate.Duration;
+                    if (double.IsFinite(duration) && duration > 0) Duration = TimeSpan.FromSeconds(duration);
+                    RaisePositionChanged();
+                    _captureTimer = new Timer(_ => RequestVideoFrame(), null, _externalFrameClock ? Timeout.Infinite : 0, 4);
+                    candidate.RequestFrame(force: true);
+                    return;
+                }
+                catch (OperationCanceledException) { candidate?.Dispose(); if (ReferenceEquals(_gpu, candidate)) _gpu = null; throw; }
+                catch (Exception ex)
+                {
+                    candidate?.Dispose();
+                    if (generation != _openGeneration || _disposed) return;
+                    _gpu = null;
+                    _fallbackReason = ex.Message;
+                    RaiseRuntimeStatus("GPU video unavailable; using CPU capture: " + ex.Message);
+                }
+            }
             _captureWidth = _captureHeight = 1;
             _captureBuffer = [];
             _lastCaptureTimestamp = 0;
@@ -84,6 +145,8 @@ public sealed class WindowsMediaFoundationBackend : NativeMediaBackend, IVideoMe
             var hr = CreateNativePlayer(source);
             if (hr < 0 || _player == 0) { RaiseError($"Media Foundation could not open the media (HRESULT 0x{hr:X8})."); return; }
             await base.OpenAsync(source, cancellationToken);
+            if (generation != _openGeneration || _disposed) return;
+            if (_fallbackReason is not null) RaiseRuntimeStatus("GPU video unavailable; using CPU capture: " + _fallbackReason);
             TryReadDuration();
             RaisePositionChanged();
             if (Duration <= TimeSpan.Zero) _durationPoller = new Timer(_ => TryReadDuration(), null, 200, 250);
@@ -98,11 +161,32 @@ public sealed class WindowsMediaFoundationBackend : NativeMediaBackend, IVideoMe
         catch (DllNotFoundException ex) { RaiseError("Media Foundation is not available.", ex); }
     }
 
-    public override Task PlayAsync(CancellationToken cancellationToken = default) { InvokeVoid(3); return base.PlayAsync(cancellationToken); }
-    public override Task PauseAsync(CancellationToken cancellationToken = default) { InvokeVoid(4); return base.PauseAsync(cancellationToken); }
-    public override Task StopAsync(CancellationToken cancellationToken = default) { InvokeVoid(5); return base.StopAsync(cancellationToken); }
+    private async void RecoverGpuFailure(GpuVideoSession session, Exception error)
+    {
+        if (_disposed || !ReferenceEquals(_gpu, session) || _source is null) return;
+        var source = _source;
+        var position = Position;
+        var playing = State == MediaState.Playing;
+        _fallbackReason = error.Message;
+        _skipGpu = true;
+        RaiseRuntimeStatus("GPU presentation failed; switching to CPU capture: " + error.Message);
+        try
+        {
+            await OpenAsync(source);
+            if (_disposed || _source != source) return;
+            Seek(position);
+            if (playing) await PlayAsync();
+        }
+        catch (Exception ex) { if (!_disposed) RaiseError("Could not recover video playback.", ex); }
+        finally { _skipGpu = false; }
+    }
+
+    public override Task PlayAsync(CancellationToken cancellationToken = default) { cancellationToken.ThrowIfCancellationRequested(); if (_gpu is { } gpu) gpu.Play(); else InvokeVoid(3); return base.PlayAsync(cancellationToken); }
+    public override Task PauseAsync(CancellationToken cancellationToken = default) { cancellationToken.ThrowIfCancellationRequested(); if (_gpu is { } gpu) gpu.Pause(); else InvokeVoid(4); return base.PauseAsync(cancellationToken); }
+    public override Task StopAsync(CancellationToken cancellationToken = default) { cancellationToken.ThrowIfCancellationRequested(); if (_gpu is { } gpu) gpu.Stop(); else InvokeVoid(5); return base.StopAsync(cancellationToken); }
     public override unsafe void Seek(TimeSpan position)
     {
+        _gpu?.Seek(position);
         if (_player != 0)
         {
             var value = new RawPropVariant { Type = 20, HValue = Math.Max(0, position.Ticks) };
@@ -113,6 +197,7 @@ public sealed class WindowsMediaFoundationBackend : NativeMediaBackend, IVideoMe
     }
     protected override unsafe TimeSpan QueryPosition()
     {
+        if (_gpu is { } gpu) { var seconds = gpu.HasEnded ? gpu.Duration : gpu.Position; return double.IsFinite(seconds) ? TimeSpan.FromSeconds(Math.Max(0, seconds)) : TimeSpan.Zero; }
         if (_player == 0) return base.QueryPosition();
         try
         {
@@ -140,8 +225,8 @@ public sealed class WindowsMediaFoundationBackend : NativeMediaBackend, IVideoMe
         }
         catch { }
     }
-    public override double Volume { get => base.Volume; set { base.Volume = value; if (_player != 0) InvokeFloat(20, (float)value); } }
-    public override bool Muted { get => base.Muted; set { base.Muted = value; if (_player != 0) InvokeBool(24, value); } }
+    public override double Volume { get => base.Volume; set { base.Volume = value; _gpu?.SetVolume(base.Volume); if (_player != 0) InvokeFloat(20, (float)base.Volume); } }
+    public override bool Muted { get => base.Muted; set { base.Muted = value; _gpu?.SetMuted(value); if (_player != 0) InvokeBool(24, value); } }
     public override void SetVideoOutput(nint handle)
     {
         if (!_videoOutputEnabled) return;
@@ -252,6 +337,8 @@ public sealed class WindowsMediaFoundationBackend : NativeMediaBackend, IVideoMe
     private unsafe void InvokeGetDuration(Guid* type, RawPropVariant* value) { var table = *(nint**)_player; ((delegate* unmanaged[Stdcall]<nint, Guid*, RawPropVariant*, int>)table[9])(_player, type, value); }
     private void CloseNativePlayer()
     {
+        _gpu?.Dispose();
+        _gpu = null;
         _captureGeneration++;
         _durationPoller?.Dispose();
         _durationPoller = null;
@@ -263,6 +350,9 @@ public sealed class WindowsMediaFoundationBackend : NativeMediaBackend, IVideoMe
     }
     public override void Dispose()
     {
+        if (_disposed) return;
+        _disposed = true;
+        ++_openGeneration;
         CloseNativePlayer();
         if (_captureWindow != 0) { NativeMethods.DestroyWindow(_captureWindow); _captureWindow = 0; }
         base.Dispose();
